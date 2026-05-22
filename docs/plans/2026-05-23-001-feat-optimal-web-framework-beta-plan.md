@@ -3,6 +3,7 @@ title: "feat: Design the optimal, robustest NURL web framework"
 type: feat
 status: active
 date: 2026-05-23
+deepened: 2026-05-23
 ---
 
 # feat: Redesign nurl_app as an optimal, production-grade web framework
@@ -102,14 +103,20 @@ Each middleware takes the inner handler closure and returns a new one. Compositi
 **D1. Ctx is a heap-boxed handle, not an inline struct.**
 Rationale: Ctx contains borrowed pointers (req, params) that cannot be moved or copied safely. Making it a single-pointer handle (`Ctx { s ctl }`) avoids the Vec stride bug and matches the established Route/Router pattern. The internal `CtxImpl` lives on the heap.
 
-**D2. Handler signature is `( @ v Ctx )` for normal responses and `( @ HttpResponse HttpRequest Params )` for streaming/upgrades.**
-Rationale: Normal handlers write into Ctx. Streaming handlers need direct access to the TcpConn and can't produce a single HttpResponse. Rather than forcing streaming through Ctx, expose it as an escape hatch.
+**D2. Handler signature is `( @ v Ctx )` for all handlers. Streaming/WS uses `ctx_hijack` escape hatch.**
+Rationale: A single handler signature keeps the API surface small and composable. Normal handlers write into Ctx via `ctx_text`/`ctx_json` etc. Handlers that need streaming or WebSocket call `ctx_hijack ctx` which extracts the borrowed TcpConn, giving the handler direct socket access. After hijack, the handler owns the connection lifecycle — it performs WS handshake or chunked writes directly, then returns void. This avoids a separate handler type while still enabling full-duplex streaming. The tradeoff: hijack is a one-way door (no falling back to normal HTTP after hijack), but this matches the HTTP upgrade semantics where upgrading is permanent.
+
+Rejected alternatives:
+- Two handler types (`( @ v Ctx )` and `( @ HttpResponse HttpRequest Params )`): rejected because it doubles the registration API surface and complicates middleware composition.
+- Streaming through Ctx response builders: rejected because chunked writes and WS frames don't map to a single HttpResponse.
 
 **D3. Single dispatch function `__dispatch`.**
 Rationale: The middleware walk + handler call + response extraction is written once and captured by every route registration. No duplication.
 
 **D4. Middleware is a `Vec[s]` of boxed `( @ b Ctx )` closures, not a linked list.**
-Rationale: Simpler allocation model. Vec iteration is well-tested in the codebase. The boxed handle pattern avoids stride bugs.
+Rationale: Simpler allocation model. Vec iteration is well-tested in the codebase. The boxed handle pattern avoids stride bugs. The v0 prototype used a linked list (`MwSlotImpl` with a `next` pointer), which added allocation complexity for no benefit — NURL's Vec iteration is cache-friendly and the middleware count per app is small (typically 3-10).
+
+Rejected alternative: Linked list with `next` pointers — added per-node allocation overhead and complex free-list management. No advantage for a small, static-at-registration-time collection.
 
 **D5. Group middleware is merged at registration time, not at dispatch time.**
 Rationale: When a route is registered on a group, the group's middleware is prepended to the app's middleware and baked into the route's dispatch closure. No per-request group lookups. This matches how Express routers work.
@@ -120,8 +127,25 @@ Rationale: The server owns the HttpRequest lifecycle. The router owns Params. Ct
 **D7. Response is stored as an `s` raw pointer (nullable HttpResponse*).**
 Rationale: HttpResponse is a multi-field struct. Storing it inline in CtxImpl would make CtxImpl a multi-field struct with a multi-field sub-field — the stride bug. Storing as `s` (pointer) avoids this. The null check (`# i rp == 0`) replaces the `responded` boolean.
 
-**D8. WebSocket upgrade returns from the handler via a special status code.**
-Rationale: The handler calls `ctx_upgrade_ws ctx handler` which sets a flag on CtxImpl. After the handler returns, the dispatch code checks the flag and, if set, performs the WebSocket handshake + serve loop using the existing `ws_perform_handshake` + `ws_serve_messages`. This avoids changing the handler signature.
+**D8. WebSocket and streaming via `ctx_hijack` escape hatch.**
+Rationale: The handler calls `ctx_hijack ctx` which returns the borrowed TcpConn. The handler then owns the connection — it calls `ws_perform_handshake` + `ws_serve_messages` for WebSocket, or `response_begin_chunked` / `response_write_chunk` / `response_end_chunked` for SSE streaming. The dispatch layer detects hijack via a flag on CtxImpl and skips normal response serialization. This avoids changing the handler signature while giving full socket access. The framework provides `__write_response` (~30 lines) for normal HTTP responses on the streaming path (e.g., middleware abort on a streaming connection), so non-upgrade requests on `app_run_streaming` still work correctly.
+
+Tradeoff: `ctx_hijack` is a one-way door — after hijacking, the handler cannot produce a normal HttpResponse. This matches HTTP semantics (connection upgrades are permanent).
+
+Rejected alternative: WS upgrade via special status code (original D8) — would require the dispatch layer to perform the handshake *after* the handler returns, creating a split-brain where the handler sets up state but the framework executes the upgrade. Hijack keeps the lifecycle in one place.
+
+**D9. Single `__dispatch` with response-writer callback.**
+Rationale: The normal path writes responses via `http_server.nu`'s handler return value. The streaming path writes responses directly to TcpConn via `__write_response`. Rather than duplicating the dispatch logic (middleware walk + handler call + response extraction), a single `__dispatch` takes a response-writer callback. Normal path passes `__write_via_server`, streaming path passes `__write_to_conn`. This eliminates ~20 lines of duplication and makes the dispatch flow a single source of truth.
+
+**D10. Pending headers list on CtxImpl.**
+Rationale: When `ctx_set_header` is called before any response exists, the header is stored in a `Vec[HeaderPair]` pending list on CtxImpl. When a response is later set, pending headers are applied to it. This replaces the v0's phantom 200 response pattern (creating `response_new 200` just to hold headers), which was misleading — the 200 status was arbitrary and would be wrong if the handler later set a 404.
+
+Rejected alternative: Phantom 200 response (v0 behavior) — works in practice (Koa/Express do this) but encodes a lie in the response object. Pending headers are honest about the state.
+
+**D11. Explicit `app_run` and `app_run_streaming` entry points.**
+Rationale: Users choose between `app_run` (uses `server_run_pool`, no TcpConn access, handles keep-alive/pipelining) and `app_run_streaming` (custom accept loop, TcpConn access via `ctx_hijack`, enables WS/SSE). Two explicit entry points rather than auto-detection. This keeps each path simple and testable — `app_run` delegates entirely to the proven `http_server.nu`, while `app_run_streaming` is a focused ~80-line accept loop.
+
+Rejected alternative: Auto-detect upgrade intent via headers — would require parsing headers before routing, adds magic routing that surprises users, and duplicates request processing that `http_server.nu` already handles.
 
 ## Open Questions
 
@@ -144,14 +168,16 @@ Rationale: The handler calls `ctx_upgrade_ws ctx handler` which sets a flag on C
 
 ```
 CtxImpl (heap-allocated)
-├── s req             // borrowed HttpRequest pointer
-├── s resp            // owned HttpResponse pointer (nullable)
-├── s params          // borrowed Params pointer
-├── s conn            // borrowed TcpConn (for streaming/upgrade)
+├── s req                // borrowed HttpRequest pointer
+├── s resp               // owned HttpResponse pointer (nullable)
+├── s params             // borrowed Params pointer
+├── s conn               // borrowed TcpConn (for ctx_hijack)
 ├── i body_limit
-├── i state           // generic scratch for middleware
-├── b ws_upgrade      // WebSocket upgrade requested
-└── s ws_handler      // boxed WebSocket message handler
+├── i request_id         // incrementing counter for log tracing
+├── i state              // generic scratch for middleware
+├── b hijacked           // handler called ctx_hijack, owns the conn
+├── s pending_headers    // heap-allocated Vec[HeaderPair], applied on response set
+└── ( @ b Ctx ) mw       // closure composition assumes handlers are wrappable
 
 Ctx { s ctl }         // single-pointer handle → CtxImpl
 
@@ -183,10 +209,11 @@ __dispatch(req, params, app_mw, group_mw, handler)
   2. Walk app_mw: for each MwEntry, call mw(ctx) → if F, return ctx.resp or 500
   3. Walk group_mw: same
   4. Call handler(ctx) → handler writes response into ctx
-  5. If ctx.resp == null → synthesize 500 "no response"
-  6. If ctx.ws_upgrade → extract TcpConn from ctx, perform WS handshake, serve
-  7. Return ctx.resp (transfer ownership)
-  8. Free CtxImpl (does NOT free req/params/resp — those have distinct owners)
+  5. If ctx.resp == null and not hijacked → synthesize 500 "no response"
+  6. If ctx.hijacked → skip normal response serialization (handler owns the conn)
+  7. Apply pending headers to ctx.resp (if any)
+  8. Return ctx.resp (transfer ownership) — or void if hijacked
+  9. Free CtxImpl via __ctx_free on ALL exit paths (including middleware abort)
 ```
 
 ### Route registration
@@ -214,17 +241,22 @@ All accessors dereference through the Ctx handle to CtxImpl, then use proper `@ 
 
 Each builder allocates an `HttpResponse`, stores it in `ctx.resp` (freeing any previous one), and sets the appropriate status/headers/body. The `__ctx_set_resp` helper handles the free-then-assign atomically.
 
-### Streaming / SSE / WebSocket
+### Streaming / SSE / WebSocket (approach C — ctx_hijack)
 
-For WebSocket:
+All streaming starts with `ctx_hijack`, which gives the handler direct TcpConn access:
+
 ```
-ctx_upgrade_ws Ctx ctx ( @ ! v WsErr WsMessage ) handler → v
-  → sets impl.ws_upgrade = T, impl.ws_handler = handler
+ctx_hijack Ctx ctx → TcpConn
+  → sets impl.hijacked = T, returns impl.conn
+  → handler now owns the connection lifecycle
+  → dispatch skips normal response serialization after handler returns
 ```
 
-After dispatch returns, the framework checks `ws_upgrade`. If true, it performs `ws_perform_handshake` + `ws_serve_messages` on the borrowed `TcpConn`, then returns a synthetic 101 response from the handshake.
+For WebSocket: handler calls `ctx_hijack`, then `ws_perform_handshake` + `ws_serve_messages` directly.
+For SSE: handler calls `ctx_hijack`, then `response_begin_chunked` / `response_write_chunk` / `response_end_chunked` directly.
+Convenience wrappers (`ctx_upgrade_ws`, `ctx_stream_begin/end`) wrap these sequences for ergonomics.
 
-For SSE / streaming: handlers that need raw streaming use `ctx_stream_begin` which calls `response_begin_chunked` on the TcpConn directly. The handler writes chunks and calls `ctx_stream_end`. The dispatch layer sees that streaming has started and skips the normal `response_serialize + write` path.
+These only work on `app_run_streaming`. Calling `ctx_hijack` on a normal `app_run` connection panics with a clear error message.
 
 ## Implementation Units
 
@@ -247,6 +279,11 @@ For SSE / streaming: handlers that need raw streaming use `ctx_stream_begin` whi
 - `HttpRequest` is reconstructed via `@ HttpRequest { . impl req_field }` — this is a borrow, not a cast
 - Remove the `responded` boolean — null check on `.resp` pointer is sufficient
 - Add `conn` field (borrowed TcpConn) for streaming/upgrade support
+
+**Review-driven additions:**
+- Add `i request_id` field to CtxImpl — incrementing counter from App, logged in access_log for request tracing
+- Add `( Vec HeaderPair ) pending_headers` to CtxImpl — stores headers set before a response exists, applied when response is set (D10)
+- Add `__ctx_free` helper that frees CtxImpl including: resp (if non-null, free HttpResponse), pending_headers (free each HeaderPair). Must be called on ALL exit paths in `__dispatch` — middleware abort, no-response, normal response.
 
 **Patterns to follow:**
 - `Route { s ctl }` / `RouteImpl` from `http_router.nu` — identical boxed-handle pattern
@@ -328,10 +365,19 @@ For SSE / streaming: handlers that need raw streaming use `ctx_stream_begin` whi
 - Create app with middleware, create group with middleware, register group route, verify both middleware run in order
 - Create app with `app_static "./public"`, register `/api/health`, verify `/api/health` doesn't hit static handler
 
+**Review-driven additions:**
+- Fix `__group_path` to always insert `/` separator when neither prefix ends with `/` nor pattern starts with `/`. The v0 code produces `/apiping` for prefix `/api` + pattern `ping` — a real path-join bug.
+- Drop `MwSlotImpl.next` field — dead weight from v0's linked list design. Vec iteration only.
+- Drop `pretty_errors` flag — was an unused boolean in v0.
+- Auto-register `/health` endpoint when `app_with_metrics` is enabled (opt-in health check).
+- Add version string to startup banner (e.g., `[nurl-app v0.2.0] listening on...`).
+- Add `// nurl_app.nu v0.2.0` version stamp in file header.
+
 **Verification:**
 - `App` struct has no raw `s` punning fields
-- Group prefix concatenation handles trailing/leading slashes correctly
+- Group prefix concatenation handles all 4 slash combinations correctly (both slashes, neither, prefix only, pattern only)
 - Static route is registered after all user routes
+- `__group_path` test: `/api` + `ping` → `/api/ping` (not `/apiping`)
 
 - [ ] **Unit 4: Streaming and WebSocket integration**
 
@@ -345,15 +391,25 @@ For SSE / streaming: handlers that need raw streaming use `ctx_stream_begin` whi
 - Modify: `stdlib/ext/nurl_app.nu` — add streaming/WS support to CtxImpl and dispatch
 - Test: `compiler/tests/nurl_app_streaming.nu` (gated behind `NURL_NET_TESTS=1`)
 
-**Approach:**
-- CtxImpl gets `b streaming_active` and `b ws_upgrade` flags
-- `ctx_stream_begin Ctx ctx i status (Vec Header) headers → ! v NetErr` — calls `response_begin_chunked` on the borrowed TcpConn
-- `ctx_stream_write Ctx ctx s data → ! v NetErr` — calls `response_write_chunk`
-- `ctx_stream_end Ctx ctx → ! v NetErr` — calls `response_end_chunked`
-- `ctx_upgrade_ws Ctx ctx ( @ ! v WsErr WsMessage ) handler → v` — sets ws_upgrade flag, stores handler
-- After `__dispatch` returns: if ws_upgrade is set, perform handshake + serve loop
-- If streaming_active is set, skip normal response serialize+write (streaming already wrote to conn)
-- The dispatch function returns a synthetic 200 when streaming/WS took over
+**Approach (approach C — ctx_hijack escape hatch):**
+- CtxImpl gets `b hijacked` flag (set when handler calls `ctx_hijack`)
+- `ctx_hijack Ctx ctx → TcpConn` — returns the borrowed TcpConn to the handler, sets hijacked flag. After this call, the handler owns the connection lifecycle.
+- The handler performs WS handshake or SSE streaming directly on the TcpConn
+- Dispatch detects `hijacked` flag and skips normal response serialization
+- `__write_response TcpConn HttpResponse → ! v NetErr` — framework-internal response serializer for non-hijacked responses on the streaming path (~30 lines, reuses `response_serialize` + `tcp_conn_write`)
+- `app_run_streaming` uses a custom accept loop (~80 lines) that: accepts TcpConn → parses request head → creates HttpRequest → calls `__dispatch` with `__write_to_conn` callback → closes connection
+- Error returns: `__write_response` returns `! v NetErr` (logged on dead socket), WS handshake returns `! v WsErr` (logged before conn close)
+- Middleware abort on streaming path: middleware's response is written via `__write_response`, then connection closes
+- Non-hijacked handlers on `app_run_streaming`: normal HttpResponse is written via `__write_response` to TcpConn
+
+**Streaming API surface:**
+- `ctx_hijack Ctx ctx → TcpConn` — one-way door, handler owns the conn after this call
+- `ctx_stream_begin Ctx ctx i status (Vec Header) headers → ! v NetErr` — convenience wrapper: hijacks + begins chunked response
+- `ctx_stream_write Ctx ctx s data → ! v NetErr` — writes a chunk
+- `ctx_stream_end Ctx ctx → ! v NetErr` — ends chunked response
+- `ctx_upgrade_ws Ctx ctx ( @ ! v WsErr WsMessage ) handler → v` — convenience wrapper: hijacks + performs WS handshake + enters message loop
+
+**Architectural note:** The custom accept loop does NOT inherit `http_server.nu`'s keep-alive pipelining. This is intentional — streaming connections (WS/SSE) are long-lived and don't need pipelining. If http_server.nu gains a streaming-aware handler contract in the future (see TODOS.md), the two paths can unify.
 
 **Patterns to follow:**
 - `http_response.nu` chunked streaming API — `response_begin_chunked` / `response_write_chunk` / `response_end_chunked`
@@ -392,7 +448,10 @@ For SSE / streaming: handlers that need raw streaming use `ctx_stream_begin` whi
 - `signal_install_shutdown` wired automatically
 - `app_on_start` / `app_on_stop` hooks run before/after the server loop
 - Panic recovery is handled by the existing `http_server.nu`'s `recover` in `__serve_keepalive_loop` — no framework-level recovery needed
-- Body limit is applied by setting `HttpLimits.body_default_max` on the server (requires `server_new_complete` instead of `server_new_with_timeout`)
+- Body limit is enforced in `__dispatch` (not delegated to server): after creating Ctx, check `vec_len(req.body)` against `body_limit`, return 413 if exceeded. This keeps enforcement in the framework's control regardless of server backend.
+- Graceful shutdown: on signal, set a flag that stops accepting new connections, wait for in-flight requests to complete (with configurable timeout, default 30s), then run `app_on_stop` hooks and exit. Uses `server_stop` + a drain wait loop.
+- CORS preflight: verify `with_cors_default` from `http_middleware.nu` intercepts OPTIONS before routing reaches the router. If it doesn't, register a global OPTIONS catch-all handler.
+- `app_run_streaming` (separate entry point): custom accept loop, uses `__write_response` for normal HTTP, passes TcpConn to handler via `ctx_hijack`. Same middleware chain and hooks as `app_run`.
 
 **Patterns to follow:**
 - `static_server.nu` example — canonical middleware composition order
@@ -441,18 +500,23 @@ For SSE / streaming: handlers that need raw streaming use `ctx_stream_begin` whi
 
 ## System-Wide Impact
 
-- **Interaction graph:** The framework sits entirely above the existing HTTP stack. It imports `http_full.nu` (which aggregates all HTTP modules). No existing module is modified.
-- **Error propagation:** Panics in handlers are caught by `http_server.nu`'s `recover` and converted to 500 responses. Parse errors in the request become 4xx from the server layer. The framework's own errors (null response, middleware abort) become 500/401/etc.
-- **State lifecycle risks:** Ctx is created per-request, freed after dispatch. No cross-request state leaks. App and Group are created once, freed at program exit. Middleware closures captured by value — no aliasing.
+- **Interaction graph:** The framework sits entirely above the existing HTTP stack. It imports `http_full.nu` (which aggregates all HTTP modules). No existing module is modified. The only exception is `app_run_streaming`, which uses `tcp_listen` + `tcp_accept` directly (bypassing `http_server.nu`) to gain TcpConn access.
+- **Error propagation:** Panics in handlers are caught by `http_server.nu`'s `recover` and converted to 500 responses (normal path). On the streaming path, panics are caught by a `recover` in the custom accept loop. Parse errors in the request become 4xx from the server layer. The framework's own errors (null response, middleware abort) become 500/401/etc.
+- **State lifecycle risks:** Ctx is created per-request, freed via `__ctx_free` on ALL dispatch exit paths. No cross-request state leaks. App and Group are created once, freed at program exit. Middleware closures captured by value at registration time — no aliasing with later registrations. Pending headers Vec on CtxImpl is bounded by handler behavior (typical: 0-5 headers) — no unbounded growth risk in practice.
+- **Metrics parity:** `app_run` wraps handlers with `with_metrics` at the outer layer, so all requests are counted. `app_run_streaming` must also wrap handlers with `with_metrics` — this is handled in the accept loop, wrapping the dispatch call. Metrics from both paths aggregate into the same `App.metrics` struct.
 - **API surface parity:** The framework exposes a superset of the router's API (all HTTP methods + groups + middleware). It does not expose every `http_server.nu` knob (e.g., `server_new_with_dos`, `server_new_complete`) — those remain available by dropping down to the raw modules.
-- **Integration coverage:** The framework integrates with WebSocket, SSE, multipart, and metrics through Ctx methods, without requiring the user to import those modules separately.
+- **Integration coverage:** The framework integrates with WebSocket, SSE, multipart, and metrics through Ctx methods, without requiring the user to import those modules separately. Users who need `ctx_hijack` must use `app_run_streaming` instead of `app_run` — calling `ctx_hijack` on a normal-path connection panics with a clear error message.
+- **Dual-path divergence:** The existence of `app_run` and `app_run_streaming` creates two server backends. Changes to middleware composition, lifecycle hooks, or request processing must be applied to both paths. The single `__dispatch` function (D9) mitigates this — the dispatch logic is shared, only the server accept loop and response writing differ. Future unification is tracked in TODOS.md.
 
 ## Risks & Dependencies
 
-- **Multi-field struct stride bug (medium)** — The boxed-handle pattern (Ctx/MwEntry/Group all use `{ s ctl }`) mitigates this. Risk: if any new struct accidentally inlines a multi-field type into a Vec, the bug returns. Mitigation: every collection element type must be a single-pointer handle.
+- **Multi-field struct stride bug (medium)** — The boxed-handle pattern (Ctx/MwEntry/Group all use `{ s ctl }`) mitigates this. Risk: if any new struct accidentally inlines a multi-field type into a Vec, the bug returns. Mitigation: every collection element type must be a single-pointer handle. CtxImpl fields that are multi-field structs (e.g., pending_headers Vec) are stored as single `s` pointer to a heap-allocated Vec, not inline.
 - **Closure capture semantics (low)** — NURL closures capture by value for immutable bindings, by pointer for `: ~` mutable multi-field structs. The dispatch closures capture `app.middleware` (a Vec, single-handle) — safe. Risk: if group middleware Vec is captured and later mutated, the captured copy is stale. Mitigation: middleware is snapshot-captured at registration time, not dispatch time.
-- **TcpConn borrow lifetime for streaming (medium)** — The framework borrows TcpConn from the server for streaming/WS. The server expects to close the conn after the handler returns. Risk: streaming writes after dispatch returns would write to a closed socket. Mitigation: streaming must complete inside the handler — the dispatch layer blocks until the handler returns.
-- **No existing test infrastructure for nurl_app (low)** — Tests must be added from scratch. Mitigation: the framework's pure-logic parts (Ctx accessors, response builders, middleware walk) can be tested without sockets.
+- **TcpConn ownership in `app_run_streaming` (low, previously medium)** — In the original plan, TcpConn was borrowed from `http_server.nu`, creating lifetime risk. Approach C resolves this: `app_run_streaming` owns the accept loop, so the handler receives the TcpConn directly with no borrowed-lifetime conflict. The handler owns the connection from hijack until return. Risk: handler leaks the TcpConn by not closing it — mitigated by the accept loop closing the conn after the handler returns as a safety net.
+- **No existing test infrastructure for nurl_app (low)** — Tests must be added from scratch. Mitigation: the framework's pure-logic parts (Ctx accessors, response builders, middleware walk) can be tested without sockets. A minimal test contract is defined: `@ test_<name> → i` returning 0/1, with `test.sh` runner and `NURL_NET_TESTS=1` gate for socket tests.
+- **Dual-path maintenance burden (low)** — Two server entry points (`app_run` / `app_run_streaming`) mean bug fixes and feature additions must consider both paths. Mitigated by shared `__dispatch` (D9) which keeps the core logic in one place. Only the accept loop and response writer differ. Tracked as technical debt in TODOS.md.
+- **`__group_path` slash bug (resolved)** — The v0 code produces incorrect paths when prefix has no trailing slash and pattern has no leading slash (`/api` + `ping` → `/apiping`). Fix: always insert `/` separator when neither side provides one. Unit 3 verification includes explicit test for all 4 slash combinations.
+- **Pending headers unbounded growth (negligible)** — If a handler calls `ctx_set_header` many times before setting a response, the pending Vec grows. In practice, handlers set 0-5 headers before the response. No mitigation needed — the Vec is freed with CtxImpl.
 
 ## Sources & References
 
@@ -466,29 +530,31 @@ For SSE / streaming: handlers that need raw streaming use `ctx_stream_begin` whi
 - **Middleware closure pattern:** `http_router.nu` lines 310-340, `http_middleware.nu`
 
 
+
+
 ## GSTACK REVIEW REPORT
 
 | Review | Trigger | Why | Runs | Status | Findings |
 |--------|---------|-----|------|--------|----------|
-| CEO Review | `/plan-ceo-review` | Scope & strategy | 1 | issues_open | SELECTIVE EXPANSION, approach B, 1 CRITICAL GAP |
-| Eng Review | `/plan-eng-review` | Architecture & tests (required) | 1 | issues_open | 6 issues, 2 CRITICAL GAPS |
+| CEO Review | `/plan-ceo-review` | Scope & strategy | 2 | issues_open | SELECTIVE EXPANSION, approach C, 2 CRITICAL GAPS (WS handshake, streaming write) |
+| Eng Review | `/plan-eng-review` | Architecture & tests (required) | 2 | issues_open | 6 issues, 2 CRITICAL GAPS resolved (streaming error handling), 3 new eng issues |
 
-**CRITICAL GAP 1 (CEO):** SSE streaming and WebSocket upgrade conflict with `http_server.nu`'s `__write_response` — server always writes a second response after the handler returns.
+**ENG REVIEW ISSUES:**
+- Issue 1 (P2): Two explicit entry points — `app_run` and `app_run_streaming` (user chose C)
+- Issue 2 (P2): `app_run_streaming` must implement `__write_response` for normal HTTP responses (user chose A)
+- Issue 3 (P2): Single `__dispatch` with response-writer callback, no duplication (user chose A)
+- Issue 4 (P2): Pending headers list on CtxImpl instead of phantom 200 response (user chose A)
+- Issue 5 (P1): Fix `__group_path` missing `/` separator when pattern has no leading slash (user chose A)
+- Issue 6 (P1): Streaming error handling — `__write_response` returns `! v NetErr`, WS handshake returns `! v WsErr`, errors logged before conn close (user chose A)
 
-**CRITICAL GAP 2 (ENG):** The framework handler CANNOT access the TcpConn. `http_server.nu`'s handler contract is `( @ HttpResponse HttpRequest )` — only the request is passed. The TcpConn is a local variable in `__serve_keepalive_loop`, unreachable from inside the handler. The plan's CtxImpl `conn` field has no way to be populated.
+**CRITICAL GAPS RESOLVED:**
+- WS handshake failure: now returns `! v WsErr`, caught and logged in streaming accept loop
+- Streaming write to dead socket: `__write_response` returns `! v NetErr`, caught and logged
 
-**Fix for both gaps:** Provide two server modes:
-- `app_run` — uses `server_run_pool` for normal HTTP-only servers (no TcpConn access needed).
-- `app_run_streaming` — uses a custom accept loop that passes TcpConn to the dispatch function, enabling SSE/WS. Reuses `http_server.nu`'s thread pool pattern but manages the connection lifecycle itself.
-For `app_run`, streaming/WS methods (`ctx_stream_begin`, `ctx_upgrade_ws`) should panic with a clear error message: "Use app_run_streaming for streaming/WebSocket support."
-
-**P2 — Group middleware ordering text vs code disagrees.** D5 says "group mw runs after app mw" but pseudo-code shows `group.middleware ++ app.middleware` (group first). Fix: clarify that app mw runs first (global), then group mw (scoped).
-
-**P2 — Plan doesn't document CtxImpl cleanup on error paths.** `__dispatch` creates CtxImpl on heap. If middleware aborts, CtxImpl must still be freed. Fix: add explicit `__ctx_free` on all exit paths in dispatch flow step 8.
-
-**P3 — Static handler closure should capture owned String by value.** No mutable capture needed in the new design.
-
-**P3 — Per-request CtxImpl heap allocation is acceptable for v1.** Same pattern as Route in http_router.nu. Pool optimization deferred.
+**PATTERNS APPLIED (from prior learnings):**
+- Prior learning: nurl-heap-cleanup-required (confidence 9) — explicit CtxImpl free on all exit paths
+- Prior learning: nurl-boxed-handle-pattern (confidence 9) — Ctx/MwEntry/Group all use `{ s ctl }`
+- Prior learning: nurl-streaming-tcpconn-gap (confidence 8) — resolved via `ctx_hijack` escape hatch
 
 **UNRESOLVED:** 0
-**VERDICT:** CEO + ENG both have open issues — 2 CRITICAL GAPS must be resolved before implementation begins. Units 1-3 (Ctx, dispatch, App/Group) are unaffected and can proceed. Unit 4 (streaming/WS) and Unit 5 (config/lifecycle) need architectural revision.
+**VERDICT:** ENG + CEO reviews both open — all CRITICAL GAPS now resolved. 6 eng issues + 3 CEO cherry-picks accepted. Ready to implement Units 1-3 immediately; Unit 4 (streaming) has clear architecture.
