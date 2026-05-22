@@ -83,7 +83,7 @@ Per-request context. Read the request, write the response.
 | `ctx_header ctx "name"` | `?String` | any request header |
 | `ctx_param ctx "name"` | `?String` | path parameter (`:name`) |
 | `ctx_body_string ctx` | `String` | full body as string (owned) |
-| `ctx_body_json ctx` | `?Json` | parsed JSON body (owned) |
+| `ctx_body_json ctx` | `! Json ParseErr` | parsed JSON body; Err on invalid JSON |
 | `ctx_query_get ctx "q"` | `?String` | query parameter |
 | `ctx_form_get ctx "field"` | `?String` | form-urlencoded field |
 | `ctx_cookie ctx "session"` | `?String` | named cookie |
@@ -185,7 +185,6 @@ Serves files from `./public/` with automatic MIME detection and path-traversal p
 | `app_with_cors` | off | Permissive CORS (`*`) + OPTIONS preflight |
 | `app_with_logging` | off | NCSA-style access log to stderr |
 | `app_with_metrics` | off | Prometheus request/latency/error counters |
-| `app_with_pretty_errors` | off | Detailed error responses |
 | `app_with_body_limit` | 10 MB | Max request body bytes |
 | `app_with_idle_timeout` | 30s | Keep-alive idle timeout |
 | `app_with_workers` | 16 | Thread pool size |
