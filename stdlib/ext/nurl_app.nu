@@ -1,4 +1,4 @@
-// stdlib/ext/nurl_app.nu — high-level web framework for NURL.  v0.2.0
+// stdlib/ext/nurl_app.nu — high-level web framework for NURL.  v0.2.1
 //
 // Inspired by FastAPI, Koa, and Express. Layers ergonomics on top of
 // the existing Phase 1–9 HTTP stack:
@@ -116,7 +116,7 @@
 //     ( ctx_redirect    Ctx ctx i status s url )  → v
 //     ( ctx_status      Ctx ctx i status )        → v
 //     ( ctx_set_header  Ctx ctx s name s val )    → v
-//     ( ctx_set_cookie  Ctx ctx s name s val )    → v
+//     ( ctx_set_cookie  Ctx ctx s name s val )    → v  // call after response builder
 //
 //     ( ctx_respond Ctx ctx ) → HttpResponse       // OWNED, for escape hatches
 //
@@ -133,7 +133,7 @@
 $ `stdlib/ext/http_full.nu`
 
 // ── Version ──────────────────────────────────────────────────────────
-: __NURL_APP_VERSION s `0.2.0`
+: __NURL_APP_VERSION s `0.2.1`
 
 // ── Internal: CtxImpl (heap-allocated per-request state) ─────────────
 //
@@ -204,6 +204,21 @@ $ `stdlib/ext/http_full.nu`
     ( nurl_free # s impl )
 }
 
+// Convert request body Vec[u] to an owned String.
+@ __body_to_string HttpRequest req → String {
+    : i blen ( vec_len [u] . req body )
+    ? == blen 0 { ^ ( string_new ) } {}
+    : String s ( string_with_cap + blen 1 )
+    : ~ i k 0
+    ~ < k blen {
+        : ? u co ( vec_get [u] . req body k )
+        ?? co { T c → { ( string_push_char s c ) } F → {} }
+        = k + k 1
+    }
+    ( __string_seal s )
+    ^ s
+}
+
 // ── Ctx request accessors ────────────────────────────────────────────
 //
 // All accessors dereference through the boxed handle. Null guard at
@@ -242,16 +257,7 @@ $ `stdlib/ext/http_full.nu`
 @ ctx_body_string Ctx ctx → String {
     : *CtxImpl impl # *CtxImpl . ctx ctl
     : HttpRequest req @ HttpRequest { . impl req }
-    : i blen ( vec_len [u] . req body )
-    : String s ( string_with_cap + blen 1 )
-    : ~ i k 0
-    ~ < k blen {
-        : ? u co ( vec_get [u] . req body k )
-        ?? co { T c → { ( string_push_char s c ) } F → {} }
-        = k + k 1
-    }
-    ( __string_seal s )
-    ^ s
+    ^ ( __body_to_string req )
 }
 
 // Parse the body as JSON. Returns Ok(Json) on success, Err(ParseErr) on failure.
@@ -259,36 +265,36 @@ $ `stdlib/ext/http_full.nu`
 @ ctx_body_json Ctx ctx → ! Json ParseErr {
     : *CtxImpl impl # *CtxImpl . ctx ctl
     : HttpRequest req @ HttpRequest { . impl req }
-    : i blen ( vec_len [u] . req body )
-    : String s ( string_with_cap + blen 1 )
-    : ~ i k 0
-    ~ < k blen {
-        : ? u co ( vec_get [u] . req body k )
-        ?? co { T c → { ( string_push_char s c ) } F → {} }
-        = k + k 1
-    }
-    ( __string_seal s )
+    : String s ( __body_to_string req )
     : ! Json ParseErr jr ( json_parse ( string_data s ) )
     ( string_free s )
     ^ jr
+}
+
+// Search a Vec[QueryPair] for a matching key. Returns owned copy of value.
+@ __search_pair ( Vec QueryPair ) pairs s key → ?String {
+    : i n ( vec_len [QueryPair] pairs )
+    : ~ i k 0
+    : ~ ?String result @ ?String { F ( string_new ) }
+    ~ < k n {
+        : ? QueryPair qo ( vec_get [QueryPair] pairs k )
+        ?? qo { T qp → {
+            ? != 0 ( nurl_str_eq ( string_data . qp key ) key ) {
+                = result @ ?String { T ( string_from ( string_data . qp value ) ) }
+                = k n
+            } {
+                = k + k 1
+            }
+        } F → { = k + k 1 } }
+    }
+    ^ result
 }
 
 @ ctx_query_get Ctx ctx s key → ?String {
     : *CtxImpl impl # *CtxImpl . ctx ctl
     : HttpRequest req @ HttpRequest { . impl req }
     : ( Vec QueryPair ) qs ( parse_query ( string_data . req query ) )
-    : i n ( vec_len [QueryPair] qs )
-    : ~ i k 0
-    : ~ ?String result @ ?String { F ( string_new ) }
-    ~ & == 0 ( vec_len [QueryPair] qs ) < k n {
-        : QueryPair qp ?? ( vec_get [QueryPair] qs k ) { T q → q F → @ QueryPair { ( string_new ) ( string_new ) } }
-        ? != 0 ( nurl_str_eq ( string_data . qp key ) key ) {
-            = result @ ?String { T ( string_from ( string_data . qp value ) ) }
-            = k n
-        } {
-            = k + k 1
-        }
-    }
+    : ?String result ( __search_pair qs key )
     ( query_pairs_free qs )
     ^ result
 }
@@ -303,16 +309,7 @@ $ `stdlib/ext/http_full.nu`
             ( string_free ctype )
             ? is_form {
                 : ( Vec QueryPair ) pairs ( parse_form_urlencoded . req body )
-                : i n ( vec_len [QueryPair] pairs )
-                : ~ i k 0
-                : ~ ?String result @ ?String { F ( string_new ) }
-                ~ < k n {
-                    : QueryPair qp ?? ( vec_get [QueryPair] pairs k ) { T q → q F → @ QueryPair { ( string_new ) ( string_new ) } }
-                    ? != 0 ( nurl_str_eq ( string_data . qp key ) key ) {
-                        = result @ ?String { T ( string_from ( string_data . qp value ) ) }
-                        = k n
-                    } { = k + k 1 }
-                }
+                : ?String result ( __search_pair pairs key )
                 ( query_pairs_free pairs )
                 ^ result
             } { ^ @ ?String { F ( string_new ) } }
@@ -561,6 +558,24 @@ $ `stdlib/ext/http_full.nu`
 //
 // All exit paths call __ctx_free to prevent memory leaks.
 
+// Walk a middleware chain. Returns T if all passed, F if any aborted.
+@ __walk_mw ( Vec s ) mw_list Ctx ctx → b {
+    : i n ( vec_len [s] mw_list )
+    : ~ b proceed T
+    : ~ i mi 0
+    ~ & proceed < mi n {
+        : s slot_p ?? ( vec_get [s] mw_list mi ) { T p → p F → # s 0 }
+        ? != 0 # i slot_p {
+            : *MwEntryImpl mw_impl # *MwEntryImpl slot_p
+            : ( @ b Ctx ) f . mw_impl mw
+            : b ok ( f ctx )
+            ? == ok 0 { = proceed F } {}
+        } {}
+        = mi + mi 1
+    }
+    ^ proceed
+}
+
 @ __dispatch HttpRequest req Params params App app ( Vec s ) app_mw ( Vec s ) group_mw ( @ v Ctx ) handler → HttpResponse {
     : i blimit . app body_limit
     ? == blimit 0 { = blimit 10485760 } {}
@@ -577,44 +592,16 @@ $ `stdlib/ext/http_full.nu`
 
     : Ctx ctx ( __ctx_new req params # s 0 blimit rid )
 
-    // Enforce body limit.
-    : HttpRequest req_inner @ HttpRequest { . ( # *CtxImpl . ctx ctl ) req }
-    : i body_len ( vec_len [u] . req_inner body )
+    // Enforce body limit directly from the request.
+    : i body_len ( vec_len [u] . req body )
     ? > body_len blimit {
         ( __ctx_free ctx )
         ^ ( response_text 413 `request body too large\n` )
     } {}
 
-    // Walk app-level middleware.
-    : i n_app_mw ( vec_len [s] app_mw )
-    : ~ b proceed T
-    : ~ i mi 0
-    ~ & proceed < mi n_app_mw {
-        : s slot_p ?? ( vec_get [s] app_mw mi ) { T p → p F → # s 0 }
-        ? != 0 # i slot_p {
-            : *MwEntryImpl impl # *MwEntryImpl slot_p
-            : ( @ b Ctx ) f . impl mw
-            : b ok ( f ctx )
-            ? == ok 0 { = proceed F } {}
-        } {}
-        = mi + mi 1
-    }
-
-    // Walk group-level middleware (app mw runs first, then group mw).
-    ? proceed {
-        : i n_grp_mw ( vec_len [s] group_mw )
-        : ~ i gi 0
-        ~ & proceed < gi n_grp_mw {
-            : s slot_p ?? ( vec_get [s] group_mw gi ) { T p → p F → # s 0 }
-            ? != 0 # i slot_p {
-                : *MwEntryImpl impl # *MwEntryImpl slot_p
-                : ( @ b Ctx ) f . impl mw
-                : b ok ( f ctx )
-                ? == ok 0 { = proceed F } {}
-            } {}
-            = gi + gi 1
-        }
-    } {}
+    // Walk middleware chains (app-level first, then group-level).
+    : b proceed ( __walk_mw app_mw ctx )
+    ? proceed { = proceed ( __walk_mw group_mw ctx ) } {}
 
     // Call handler.
     ? proceed { ( handler ctx ) } {}
@@ -801,21 +788,48 @@ $ `stdlib/ext/http_full.nu`
     } {}
 }
 
-// ── app_run ──────────────────────────────────────────────────────────
+// Print the startup banner. Reads resolved config from App.
+@ __print_banner App app s host i port s extra → v {
+    : i wk . app workers
 
-@ app_run App app s host i port → i {
-    // Register static route if configured.
-    ( __register_static app )
+    ( nurl_print `[nurl-app v` )
+    ( nurl_print __NURL_APP_VERSION )
+    ( nurl_print `] listening on http://` )
+    ( nurl_print host )
+    ( nurl_print `:` )
+    ( nurl_print ( nurl_str_int port ) )
+    ( nurl_print `/  routes=` )
+    ( nurl_print ( nurl_str_int ( router_count . app router ) ) )
+    ( nurl_print `  workers=` )
+    ( nurl_print ( nurl_str_int wk ) )
+    ( nurl_print extra )
+    ( nurl_print `\n` )
+}
 
-    // Auto-register /health when metrics are enabled.
+// Register the /health endpoint if metrics are enabled.
+@ __register_health App app → v {
     ? . app use_metrics {
         ( app_get app `/health` \ Ctx ctx → v {
             ( ctx_json_str ctx 200 `{"status":"ok"}` )
         } )
     } {}
+}
 
-    // Run on_start hooks.
+// Prepare for server startup: resolve config defaults, register routes, run hooks.
+@ __prepare_run App app → v {
+    // Resolve config defaults (0 = use default).
+    ? == . app idle_timeout_ms 0 { = . app idle_timeout_ms 30000 } {}
+    ? == . app workers 0 { = . app workers 16 } {}
+
+    ( __register_static app )
+    ( __register_health app )
     ( __run_hooks . app on_start_hooks )
+}
+
+// ── app_run ──────────────────────────────────────────────────────────
+
+@ app_run App app s host i port → i {
+    ( __prepare_run app )
 
     // Build the base handler that dispatches through the router.
     : ( @ HttpResponse HttpRequest ) base
@@ -842,22 +856,9 @@ $ `stdlib/ext/http_full.nu`
             ( signal_install_shutdown listener )
 
             : i timeout . app idle_timeout_ms
-            ? == timeout 0 { = timeout 30000 } {}
-
             : i wk . app workers
-            ? == wk 0 { = wk 16 } {}
 
-            ( nurl_print `[nurl-app v` )
-            ( nurl_print __NURL_APP_VERSION )
-            ( nurl_print `] listening on http://` )
-            ( nurl_print host )
-            ( nurl_print `:` )
-            ( nurl_print ( nurl_str_int port ) )
-            ( nurl_print `/  routes=` )
-            ( nurl_print ( nurl_str_int ( router_count . app router ) ) )
-            ( nurl_print `  workers=` )
-            ( nurl_print ( nurl_str_int wk ) )
-            ( nurl_print `\n` )
+            ( __print_banner app host port `` )
 
             : HttpServer srv ( server_new_with_timeout listener wrapped timeout )
             : ! v NetErr rr ( server_run_pool srv wk )
@@ -980,81 +981,37 @@ $ `stdlib/ext/http_full.nu`
 // loop that passes TcpConn to the dispatch function.
 
 @ app_run_streaming App app s host i port → i {
-    // Register static route if configured.
-    ( __register_static app )
-
-    // Auto-register /health when metrics are enabled.
-    ? . app use_metrics {
-        ( app_get app `/health` \ Ctx ctx → v {
-            ( ctx_json_str ctx 200 `{"status":"ok"}` )
-        } )
-    } {}
-
-    // Run on_start hooks.
-    ( __run_hooks . app on_start_hooks )
+    ( __prepare_run app )
 
     // Bind.
     : ! TcpListener NetErr lr ( tcp_listen host port )
     ?? lr {
         T listener → {
+            ( signal_install_shutdown listener )
+
             : i timeout . app idle_timeout_ms
-            ? == timeout 0 { = timeout 30000 } {}
-
             : i wk . app workers
-            ? == wk 0 { = wk 16 } {}
 
-            ( nurl_print `[nurl-app v` )
-            ( nurl_print __NURL_APP_VERSION )
-            ( nurl_print `] listening on http://` )
-            ( nurl_print host )
-            ( nurl_print `:` )
-            ( nurl_print ( nurl_str_int port ) )
-            ( nurl_print `/  routes=` )
-            ( nurl_print ( nurl_str_int ( router_count . app router ) ) )
-            ( nurl_print `  workers=` )
-            ( nurl_print ( nurl_str_int wk ) )
-            ( nurl_print `  streaming=enabled\n` )
+            ( __print_banner app host port `  streaming=enabled` )
 
-            // Custom accept loop.
+            // Custom accept loop — bypasses http_server.nu to provide
+            // TcpConn access for hijack/streaming/WS.
             : ~ b running T
             ~ running {
                 : ! TcpConn NetErr ar ( tcp_accept listener )
                 ?? ar {
                     T conn → {
-                        // Parse request head.
                         : ! HttpRequest NetErr pr ( parse_request_head conn timeout )
                         ?? pr {
                             T req → {
-                                // Dispatch through the router. The router
-                                // closure was registered by __register_route
-                                // and calls __dispatch internally.
                                 : HttpResponse resp ( router_handle . app router req )
-                                // Check if the response was from a hijacked
-                                // connection (ctx_hijack was called). In that
-                                // case, the handler already wrote to the conn.
-                                // For non-hijacked, write the response ourselves.
-                                // (The dispatch function returns a synthetic 200
-                                // for hijacked connections, which we skip.)
-                                // Check the hijacked flag on the most recent Ctx.
-                                // Since we can't easily check from here, we use
-                                // a simpler approach: router_handle returns the
-                                // response from __dispatch. For hijacked connections,
-                                // __dispatch returns ( response_status_only 200 ).
-                                // We skip writing for status-only 200 responses
-                                // on the streaming path. This is a heuristic.
-                                : i st ( response_status . resp )
-                                // response_status accessor may not exist; use
-                                // a simpler check: just write all responses.
-                                // The hijack path already closed the conn, so
-                                // writing to it will fail harmlessly (NetErr).
+                                // Write response to conn. For hijacked connections
+                                // __dispatch returns a synthetic 200; writing to the
+                                // already-closed conn fails harmlessly (NetErr).
                                 : ! v NetErr we ( __write_response conn resp )
-                                ?? we {
-                                    T _ → {}
-                                    F _ → {
-                                        // Connection write error — log and continue.
-                                        ( nurl_eprint `[nurl-app] stream write error\n` )
-                                    }
-                                }
+                                ?? we { T _ → {} F _ → {
+                                    ( nurl_eprint `[nurl-app] stream write error\n` )
+                                } }
                                 ( http_response_free resp )
                             }
                             F _ → {}
@@ -1062,15 +1019,13 @@ $ `stdlib/ext/http_full.nu`
                         ( tcp_conn_close conn )
                     }
                     F _ → {
-                        // Accept error — check if shutdown was requested.
-                        // For now, just continue.
+                        // Accept error — check for shutdown signal.
+                        ? ( signal_shutdown_requested ) { = running F } {}
                     }
                 }
             }
 
             ( signal_clear_shutdown )
-
-            // Run on_stop hooks.
             ( __run_hooks . app on_stop_hooks )
 
             ( nurl_print `[nurl-app] clean shutdown\n` )

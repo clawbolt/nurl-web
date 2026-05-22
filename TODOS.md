@@ -25,3 +25,20 @@
 - **Cons:** Small perf overhead per request
 - **Context:** Noted during Section 8 observability review. Deferred for v1.
 - **Effort:** S
+
+## P3 — ctx_set_cookie phantom response ordering
+- **What:** `ctx_set_cookie` creates a phantom `response_new 200` when called before any response builder. If the handler later calls `ctx_text 404`, the phantom 200 (and its cookie) is freed and lost.
+- **Why:** The pending-headers mechanism (D10) was designed to avoid this pattern, but cookies weren't included in it.
+- **Workaround:** Call `ctx_set_cookie` *after* the response builder (e.g., after `ctx_text`, `ctx_json_str`).
+- **Pros of fix:** Correct behavior regardless of call order
+- **Cons of fix:** Adds a pending_cookies Vec to CtxImpl, increases complexity
+- **Effort:** M
+- **Depends on:** None
+
+## P2 — Streaming accept loop writes to potentially-active conn
+- **What:** After `ctx_hijack`, `app_run_streaming` still calls `__write_response` on the conn. For long-lived WebSocket handlers, this could inject garbage HTTP data onto the active connection.
+- **Why:** `__dispatch` returns a synthetic 200 for hijacked connections, and the streaming loop writes it to the conn unconditionally.
+- **Context:** Safe in practice because NURL's synchronous model means the handler completes before `__write_response` runs. But if a handler spawns a background task or the execution model changes, this becomes a real bug.
+- **Workaround:** None currently — this is inherent to the streaming architecture.
+- **Effort:** M (requires a way to distinguish hijacked responses, e.g., status 0 sentinel or tagged union)
+- **Depends on:** NURL `router_any` handler return type
