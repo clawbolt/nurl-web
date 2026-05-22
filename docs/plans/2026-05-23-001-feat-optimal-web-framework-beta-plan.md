@@ -465,21 +465,30 @@ For SSE / streaming: handlers that need raw streaming use `ctx_stream_begin` whi
 - **Route boxed-handle pattern:** `http_router.nu` lines 73-84
 - **Middleware closure pattern:** `http_router.nu` lines 310-340, `http_middleware.nu`
 
+
 ## GSTACK REVIEW REPORT
 
 | Review | Trigger | Why | Runs | Status | Findings |
 |--------|---------|-----|------|--------|----------|
-| CEO Review | `/plan-ceo-review` | Scope & strategy | 1 | issues_open | SELECTIVE EXPANSION, approach B accepted, 3 findings (1 CRITICAL) |
+| CEO Review | `/plan-ceo-review` | Scope & strategy | 1 | issues_open | SELECTIVE EXPANSION, approach B, 1 CRITICAL GAP |
+| Eng Review | `/plan-eng-review` | Architecture & tests (required) | 1 | issues_open | 6 issues, 2 CRITICAL GAPS |
 
-**CRITICAL GAP:** SSE streaming and WebSocket upgrade architecturally conflict with `http_server.nu`'s write path. The server's `__serve_keepalive_loop` always calls `__write_response` after the handler returns (line 647 of http_server.nu). If a handler performs chunked streaming or WS handshake directly on the TcpConn, the server then writes a second response on the same connection — protocol corruption. The plan's claim that "the dispatch layer sees that streaming has started and skips the normal serialize+write path" is incorrect because the dispatch layer does not control `http_server.nu`'s behavior. The server is the caller; the handler is the callee.
+**CRITICAL GAP 1 (CEO):** SSE streaming and WebSocket upgrade conflict with `http_server.nu`'s `__write_response` — server always writes a second response after the handler returns.
 
-**Fix required:** The framework must either (a) use a custom accept loop instead of `server_run_pool` for streaming-capable servers, (b) use the existing `response_begin_chunked` + `response_write_chunk` + `response_end_chunked` pattern where the handler returns a normal 200 HttpResponse and the chunked streaming happens via the server's normal write path (not possible with current http_server.nu), or (c) introduce a convention where the handler returns a sentinel response that the framework's outer handler closure intercepts before the server sees it. Option (c) is the least invasive: wrap `server_run_pool`'s handler in a closure that checks the Ctx for streaming/WS state and, if active, handles the conn lifecycle itself without returning to the server's write path. This requires the framework to manage the TcpConn close, which conflicts with the server's close. **Recommended: option (a)** — the framework provides its own `__app_serve_conn` function that replaces the keep-alive loop for connections that need streaming.
+**CRITICAL GAP 2 (ENG):** The framework handler CANNOT access the TcpConn. `http_server.nu`'s handler contract is `( @ HttpResponse HttpRequest )` — only the request is passed. The TcpConn is a local variable in `__serve_keepalive_loop`, unreachable from inside the handler. The plan's CtxImpl `conn` field has no way to be populated.
 
-**WARNING:** Middleware registration order constraint. Middleware is snapshot-captured at route registration time (D5). If a user calls `app_use` after `app_get`, the middleware does not apply to routes already registered. This is the Express behavior but should be documented prominently in the API docs and the README. Recommended: add a runtime warning when `app_use` is called after any route has been registered.
+**Fix for both gaps:** Provide two server modes:
+- `app_run` — uses `server_run_pool` for normal HTTP-only servers (no TcpConn access needed).
+- `app_run_streaming` — uses a custom accept loop that passes TcpConn to the dispatch function, enabling SSE/WS. Reuses `http_server.nu`'s thread pool pattern but manages the connection lifecycle itself.
+For `app_run`, streaming/WS methods (`ctx_stream_begin`, `ctx_upgrade_ws`) should panic with a clear error message: "Use app_run_streaming for streaming/WebSocket support."
 
-**INFO:** R8 ("no raw pointer casts") is overstated. The boxed-handle `{ s ctl }` pattern internally stores raw `s` pointers — this is the established NURL idiom (Route, Regex, Channel, McpClient all do this). R8 should be refined to: "no raw `s` punning in user-visible API types — internal boxed handles follow the `Route { s ctl }` pattern."
+**P2 — Group middleware ordering text vs code disagrees.** D5 says "group mw runs after app mw" but pseudo-code shows `group.middleware ++ app.middleware` (group first). Fix: clarify that app mw runs first (global), then group mw (scoped).
 
-**UNRESOLVED:** 0 (all findings have recommended fixes)
-**VERDICT:** CEO REVIEW — 1 CRITICAL GAP requires architectural decision before implementation begins
-REVIEW_EOF
-echo "appended review report"
+**P2 — Plan doesn't document CtxImpl cleanup on error paths.** `__dispatch` creates CtxImpl on heap. If middleware aborts, CtxImpl must still be freed. Fix: add explicit `__ctx_free` on all exit paths in dispatch flow step 8.
+
+**P3 — Static handler closure should capture owned String by value.** No mutable capture needed in the new design.
+
+**P3 — Per-request CtxImpl heap allocation is acceptable for v1.** Same pattern as Route in http_router.nu. Pool optimization deferred.
+
+**UNRESOLVED:** 0
+**VERDICT:** CEO + ENG both have open issues — 2 CRITICAL GAPS must be resolved before implementation begins. Units 1-3 (Ctx, dispatch, App/Group) are unaffected and can proceed. Unit 4 (streaming/WS) and Unit 5 (config/lifecycle) need architectural revision.
