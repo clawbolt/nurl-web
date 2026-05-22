@@ -1,16 +1,8 @@
-// stdlib/ext/nurl_app.nu — high-level web framework for NURL.
+// stdlib/ext/nurl_app.nu — high-level web framework for NURL.  v0.2.0
 //
 // Inspired by FastAPI, Koa, and Express. Layers ergonomics on top of
-// the existing Phase 1–9 HTTP stack:
-//
-//   * Phase 1:  tcp_listen / tcp_accept / TcpConn           (std/net)
-//   * Phase 2:  HttpRequest / parse_request_head             (ext/http_request)
-//   * Phase 3:  HttpResponse / response_text / response_json (ext/http_response)
-//   * Phase 4-5: server_new / server_run / server_run_pool   (ext/http_server)
-//   * Phase 6:  Router / router_get / router_handle / Params (ext/http_router)
-//   * Phase 7:  serve_static / auth / cookies                (ext/http_static, ext/http_auth)
-//   * Phase 8:  with_access_log / with_metrics / Metrics      (ext/http_middleware)
-//   * Phase 9:  multipart / WebSocket / HTTP/2 / TLS          (ext/websocket, ...)
+// the existing Phase 1–9 HTTP stack. Pure NURL stdlib module — no
+// compiler or runtime changes required.
 //
 // ── Quick start ──────────────────────────────────────────────────────
 //
@@ -26,170 +18,130 @@
 //       ^ ( app_run app `0.0.0.0` 8080 )
 //     }
 //
-// ── Core concepts ────────────────────────────────────────────────────
-//
-//   App       — top-level application builder. Owns Router + middleware
-//               chain + config. Created via `app_new`, routes registered
-//               via `app_get` / `app_post` / etc., run via `app_run`.
-//
-//   Ctx       — per-request context. Thin wrapper over the raw
-//               HttpRequest + HttpResponse that carries state through
-//               the handler + middleware chain. Read the request, build
-//               the response. The framework frees both after the handler
-//               returns.
-//
-//   Handler   — `( @ v Ctx )` closure. Receives a borrowed Ctx, writes
-//               a response into it, returns void. The framework serialises
-//               the response after the handler returns.
-//
-//   Middleware — `( @ b Ctx )` closure. Runs before the handler. Return
-//               `T` to continue the chain, `F` to abort (response already
-//               set). Applied in registration order. Typical uses: auth,
-//               rate limiting, request logging, body size checks.
-//
-//   Group     — route group with shared prefix + group-local middleware.
-//               Created via `app_group`. Middleware on the group applies
-//               to every route in the group. Groups can nest.
-//
 // ── API ──────────────────────────────────────────────────────────────
 //
-//   App construction:
-//     ( app_new )                                        → App
-//     ( app_free App app )                               → v
-//
-//   Configuration (call before app_run):
-//     ( app_with_cors App app )                          → App
-//     ( app_with_logging App app )                       → App
-//     ( app_with_metrics App app )                       → App
-//     ( app_with_body_limit App app i max_bytes )        → App
-//     ( app_with_idle_timeout App app i ms )             → App
-//     ( app_with_workers App app i n )                   → App
-//     ( app_with_pretty_errors App app )                 → App
-//     ( app_static App app s dir )                       → v
-//
-//   Route registration:
-//     ( app_get    App app s pattern ( @ v Ctx ) handler ) → v
-//     ( app_post   App app s pattern ( @ v Ctx ) handler ) → v
-//     ( app_put    App app s pattern ( @ v Ctx ) handler ) → v
-//     ( app_patch  App app s pattern ( @ v Ctx ) handler ) → v
-//     ( app_delete App app s pattern ( @ v Ctx ) handler ) → v
-//
-//   Middleware:
-//     ( app_use App app ( @ b Ctx ) mw )                 → v
-//
-//   Route groups:
-//     ( app_group App app s prefix )                     → Group
-//     ( group_get    Group g s pattern ( @ v Ctx ) h )    → v
-//     ( group_post   Group g s pattern ( @ v Ctx ) h )    → v
-//     ( group_use    Group g ( @ b Ctx ) mw )              → v
-//
-//   Server lifecycle:
-//     ( app_run App app s host i port )                  → i
-//     ( app_on_start App app ( @ v ) hook )              → v
-//     ( app_on_stop  App app ( @ v ) hook )              → v
-//
-//   Ctx — request accessors (all return borrowed/raw values):
-//     ( ctx_method       Ctx ctx ) → s
-//     ( ctx_path         Ctx ctx ) → s
-//     ( ctx_query_string Ctx ctx ) → s
-//     ( ctx_header       Ctx ctx s name ) → ? String
-//     ( ctx_param        Ctx ctx s name ) → ? String
-//     ( ctx_body_string  Ctx ctx ) → String      // OWNED
-//     ( ctx_body_json    Ctx ctx ) → ? Json       // OWNED (Some arm)
-//     ( ctx_query_get    Ctx ctx s key ) → ? String
-//     ( ctx_form_get     Ctx ctx s key ) → ? String
-//     ( ctx_cookie       Ctx ctx s name ) → ? String
-//     ( ctx_bearer       Ctx ctx ) → ? String
-//     ( ctx_basic_auth   Ctx ctx ) → ? BasicAuth
-//
-//   Ctx — response builders (each sets status + body + Content-Type):
-//     ( ctx_text        Ctx ctx i status s body ) → v
-//     ( ctx_html        Ctx ctx i status s body ) → v
-//     ( ctx_json_str    Ctx ctx i status s body ) → v
-//     ( ctx_json        Ctx ctx i status Json j ) → v
-//     ( ctx_redirect    Ctx ctx i status s url )  → v
-//     ( ctx_status      Ctx ctx i status )        → v
-//     ( ctx_set_header  Ctx ctx s name s val )    → v
-//     ( ctx_set_cookie  Ctx ctx s name s val )    → v
-//
-//     ( ctx_respond Ctx ctx ) → HttpResponse       // OWNED, for escape hatches
-//
-//   Helpers:
-//     ( app_count App app ) → i                   // number of registered routes
+//   App:     app_new, app_free, app_with_*, app_static, app_count
+//   Routes:  app_get/post/put/patch/delete, app_use
+//   Groups:  app_group, group_get/post/put/patch/delete, group_use
+//   Server:  app_run, app_run_streaming, app_on_start, app_on_stop
+//   Ctx req: ctx_method/path/query_string/header/param/body_string/
+//            body_json/query_get/form_get/cookie/bearer/basic_auth
+//   Ctx res: ctx_text/html/json_str/json/redirect/status/
+//            set_header/set_cookie/respond
+//   Stream:  ctx_hijack, ctx_stream_begin/write/end, ctx_upgrade_ws
 
 $ `stdlib/ext/http_full.nu`
 
-// ── Ctx (per-request context) ────────────────────────────────────────
+// ── Version ──────────────────────────────────────────────────────────
+: __NURL_APP_VERSION s `0.2.0`
+
+// ── Internal: CtxImpl (heap-allocated per-request state) ─────────────
 //
-// The heart of the framework. Each incoming request creates one Ctx;
-// the handler (and middleware chain) mutates it; the framework reads
-// the response out after the handler returns.
+// Boxed-handle pattern: Ctx { s ctl } → single pointer to CtxImpl.
+// Avoids the Vec multi-field-struct stride bug. Same pattern as
+// Route { s ctl } in http_router.nu.
 //
 // Memory model:
-//   * `.req` is BORROWED from the server — do NOT free.
-//   * `.resp` starts as NULL (0). After the handler writes via
-//     ctx_text / ctx_json / etc., .resp points to an OWNED
-//     HttpResponse that the framework frees after serialise+write.
-//   * `.params` is BORROWED from the router dispatch — do NOT free.
-//   * `.state` is a generic i64 scratch slot for middleware to stash
-//     per-request state (user ID, rate limit counter, etc.).
+//   req     — BORROWED from server, do NOT free
+//   resp    — OWNED HttpResponse pointer, 0 = null
+//   params  — BORROWED from router dispatch, do NOT free
+//   conn    — BORROWED TcpConn, only non-zero on streaming path
+//   pending — OWNED Vec of HeaderPair, applied when response is set
 
-: Ctx {
-    s req                // borrowed HttpRequest pointer (raw s)
-    s resp               // owned HttpResponse pointer (raw s), 0 = unset
-    s params             // borrowed Params pointer (raw s)
-    i body_limit         // max body bytes (0 = default 10 MB)
-    b responded          // T after a ctx_* response method is called
-    i state              // generic i64 scratch for middleware
+: CtxImpl {
+    s req                // borrowed HttpRequest
+    s resp               // owned HttpResponse (0 = null)
+    s params             // borrowed Params
+    s conn               // borrowed TcpConn (streaming path)
+    i body_limit         // max body bytes
+    i request_id         // incrementing counter for log tracing
+    i state              // generic scratch for middleware
+    b hijacked           // handler called ctx_hijack
+    s pending_headers    // heap Vec[HeaderPair] (0 = null)
 }
+
+: Ctx { s ctl }         // single-pointer handle → CtxImpl
 
 // ── Ctx constructors ─────────────────────────────────────────────────
 
-@ __ctx_new HttpRequest req Params params i body_limit → Ctx {
-    ^ @ Ctx { # s req # s 0 # s params body_limit F 0 }
+@ __ctx_new HttpRequest req Params params s conn i body_limit i request_id → Ctx {
+    : *CtxImpl impl # *CtxImpl ( nurl_alloc Z CtxImpl )
+    = . impl req # s req
+    = . impl resp # s 0
+    = . impl params # s params
+    = . impl conn conn
+    = . impl body_limit body_limit
+    = . impl request_id request_id
+    = . impl state 0
+    = . impl hijacked F
+    = . impl pending_headers # s 0
+    ^ @ Ctx { # s impl }
 }
 
+// Free CtxImpl and all owned data. Safe to call on any exit path.
 @ __ctx_free Ctx ctx → v {
-    : s rp . ctx resp
-    : i raw # i rp
-    ? != raw 0 {
-        // Safe cast: we know it's an HttpResponse pointer
-        : s hp # s rp
-        : HttpResponse hr @ HttpResponse { hp }
-        ( http_response_free hr )
+    : *CtxImpl impl # *CtxImpl . ctx ctl
+
+    // Free owned response (if any).
+    : s rp . impl resp
+    ? != 0 # i rp {
+        : HttpResponse r @ HttpResponse { rp }
+        ( http_response_free r )
     } {}
+
+    // Free pending headers (if any).
+    : s pp . impl pending_headers
+    ? != 0 # i pp {
+        : ( Vec HeaderPair ) pv @ ( Vec HeaderPair ) { pp }
+        // HeaderPair has no heap sub-allocations in the common case
+        // (key/value are borrowed from the header string), so vec_free
+        // is sufficient.
+        ( vec_free [HeaderPair] pv )
+    } {}
+
+    // Free the CtxImpl itself. Do NOT free req/params/conn — those
+    // are borrowed with distinct owners.
+    ( nurl_free # s impl )
 }
 
 // ── Ctx request accessors ────────────────────────────────────────────
+//
+// All accessors dereference through the boxed handle. Null guard at
+// dispatch entry ensures req/params are valid for the handler duration.
 
 @ ctx_method Ctx ctx → s {
-    : HttpRequest req @ HttpRequest { . ctx req }
+    : *CtxImpl impl # *CtxImpl . ctx ctl
+    : HttpRequest req @ HttpRequest { . impl req }
     ^ ( string_data . req method )
 }
 
 @ ctx_path Ctx ctx → s {
-    : HttpRequest req @ HttpRequest { . ctx req }
+    : *CtxImpl impl # *CtxImpl . ctx ctl
+    : HttpRequest req @ HttpRequest { . impl req }
     ^ ( string_data . req path )
 }
 
 @ ctx_query_string Ctx ctx → s {
-    : HttpRequest req @ HttpRequest { . ctx req }
+    : *CtxImpl impl # *CtxImpl . ctx ctl
+    : HttpRequest req @ HttpRequest { . impl req }
     ^ ( string_data . req query )
 }
 
 @ ctx_header Ctx ctx s name → ?String {
-    : HttpRequest req @ HttpRequest { . ctx req }
+    : *CtxImpl impl # *CtxImpl . ctx ctl
+    : HttpRequest req @ HttpRequest { . impl req }
     ^ ( header_get . req headers name )
 }
 
 @ ctx_param Ctx ctx s name → ?String {
-    : Params p @ Params { . ctx params }
+    : *CtxImpl impl # *CtxImpl . ctx ctl
+    : Params p @ Params { . impl params }
     ^ ( params_get p name )
 }
 
-// Return the full body as an owned String.
 @ ctx_body_string Ctx ctx → String {
-    : HttpRequest req @ HttpRequest { . ctx req }
+    : *CtxImpl impl # *CtxImpl . ctx ctl
+    : HttpRequest req @ HttpRequest { . impl req }
     : i blen ( vec_len [u] . req body )
     : String s ( string_with_cap + blen 1 )
     : ~ i k 0
@@ -202,10 +154,11 @@ $ `stdlib/ext/http_full.nu`
     ^ s
 }
 
-// Parse the body as JSON. Returns Some(Json) on success, None on failure.
-// Caller owns the Json in the Some arm (free with json_free).
-@ ctx_body_json Ctx ctx → ?Json {
-    : HttpRequest req @ HttpRequest { . ctx req }
+// Parse the body as JSON. Returns Ok(Json) on success, Err(ParseErr) on failure.
+// Caller owns the Json in the Ok arm (free with json_free).
+@ ctx_body_json Ctx ctx → ! Json ParseErr {
+    : *CtxImpl impl # *CtxImpl . ctx ctl
+    : HttpRequest req @ HttpRequest { . impl req }
     : i blen ( vec_len [u] . req body )
     : String s ( string_with_cap + blen 1 )
     : ~ i k 0
@@ -217,15 +170,12 @@ $ `stdlib/ext/http_full.nu`
     ( __string_seal s )
     : ! Json ParseErr jr ( json_parse ( string_data s ) )
     ( string_free s )
-    ?? jr {
-        T j → ^ @ ?Json { T j }
-        F _ → ^ @ ?Json { F ( json_null ) }
-    }
+    ^ jr
 }
 
-// Get a query parameter by name.
 @ ctx_query_get Ctx ctx s key → ?String {
-    : HttpRequest req @ HttpRequest { . ctx req }
+    : *CtxImpl impl # *CtxImpl . ctx ctl
+    : HttpRequest req @ HttpRequest { . impl req }
     : ( Vec QueryPair ) qs ( parse_query ( string_data . req query ) )
     : i n ( vec_len [QueryPair] qs )
     : ~ i k 0
@@ -243,9 +193,9 @@ $ `stdlib/ext/http_full.nu`
     ^ result
 }
 
-// Get a form-urlencoded field by name.
 @ ctx_form_get Ctx ctx s key → ?String {
-    : HttpRequest req @ HttpRequest { . ctx req }
+    : *CtxImpl impl # *CtxImpl . ctx ctl
+    : HttpRequest req @ HttpRequest { . impl req }
     : ? String ct ( header_get . req headers `Content-Type` )
     ?? ct {
         T ctype → {
@@ -271,44 +221,58 @@ $ `stdlib/ext/http_full.nu`
     }
 }
 
-// Get a named cookie from the request.
 @ ctx_cookie Ctx ctx s name → ?String {
-    : HttpRequest req @ HttpRequest { . ctx req }
+    : *CtxImpl impl # *CtxImpl . ctx ctl
+    : HttpRequest req @ HttpRequest { . impl req }
     ^ ( request_cookie req name )
 }
 
-// Get the Bearer token from the Authorization header.
 @ ctx_bearer Ctx ctx → ?String {
-    : HttpRequest req @ HttpRequest { . ctx req }
+    : *CtxImpl impl # *CtxImpl . ctx ctl
+    : HttpRequest req @ HttpRequest { . impl req }
     ^ ( parse_bearer_auth req )
 }
 
-// Get the Basic auth credentials from the Authorization header.
 @ ctx_basic_auth Ctx ctx → ?BasicAuth {
-    : HttpRequest req @ HttpRequest { . ctx req }
+    : *CtxImpl impl # *CtxImpl . ctx ctl
+    : HttpRequest req @ HttpRequest { . impl req }
     ^ ( parse_basic_auth req )
 }
 
 // ── Ctx response builders ────────────────────────────────────────────
 //
-// Each builder creates an owned HttpResponse, stores it in ctx.resp,
-// and sets ctx.responded = T. If a previous response was set, it is
-// freed first (last-write-wins, matching Koa semantics).
+// Each builder allocates an HttpResponse, stores it in impl.resp
+// (freeing any previous one), and applies any pending headers.
 
 @ __ctx_set_resp Ctx ctx HttpResponse r → v {
+    : *CtxImpl impl # *CtxImpl . ctx ctl
+
     // Free any previous response.
-    : s old_rp . ctx resp
-    : i old_raw # i old_rp
-    ? != old_raw 0 {
-        : s hp # s old_rp
-        : HttpResponse old @ HttpResponse { hp }
+    : s old_rp . impl resp
+    ? != 0 # i old_rp {
+        : HttpResponse old @ HttpResponse { old_rp }
         ( http_response_free old )
     } {}
-    // Store new response. We repack the HttpResponse handle into
-    // raw s storage because Ctx.resp is typed as `s` for the
-    // null-pointer check.
-    = . ctx resp # s . r raw
-    = . ctx responded T
+
+    // Store new response.
+    = . impl resp # s . r raw
+
+    // Apply pending headers (if any).
+    : s pp . impl pending_headers
+    ? != 0 # i pp {
+        : ( Vec HeaderPair ) pv @ ( Vec HeaderPair ) { pp }
+        : i n ( vec_len [HeaderPair] pv )
+        : ~ i k 0
+        ~ < k n {
+            : ? HeaderPair ho ( vec_get [HeaderPair] pv k )
+            ?? ho { T h → {
+                ( response_set_header r ( string_data . h key ) ( string_data . h value ) )
+            } F → {} }
+            = k + k 1
+        }
+        ( vec_free [HeaderPair] pv )
+        = . impl pending_headers # s 0
+    } {}
 }
 
 @ ctx_text Ctx ctx i status s body → v {
@@ -343,31 +307,33 @@ $ `stdlib/ext/http_full.nu`
     ( __ctx_set_resp ctx r )
 }
 
+// Set a header. If no response exists yet, store in pending_headers list.
 @ ctx_set_header Ctx ctx s name s val → v {
-    // If a response is already set, mutate it in place.
-    // Otherwise create a placeholder.
-    : s rp . ctx resp
-    : i raw # i rp
-    ? != raw 0 {
-        : s hp # s rp
-        : HttpResponse r @ HttpResponse { hp }
+    : *CtxImpl impl # *CtxImpl . ctx ctl
+    : s rp . impl resp
+    ? != 0 # i rp {
+        // Response exists — apply directly.
+        : HttpResponse r @ HttpResponse { rp }
         ( response_set_header r name val )
     } {
-        // No response yet — create one just to hold the header.
-        // This is unusual but safe; the handler should set a
-        // proper response before returning.
-        : HttpResponse r ( response_new status )
-        ( response_set_header r name val )
-        ( __ctx_set_resp ctx r )
+        // No response yet — append to pending headers.
+        : s pp . impl pending_headers
+        ? == 0 # i pp {
+            // First pending header — create the Vec.
+            = . impl pending_headers # s ( vec_new [HeaderPair] )
+        } {}
+        : s pp2 . impl pending_headers
+        : ( Vec HeaderPair ) pv @ ( Vec HeaderPair ) { pp2 }
+        : HeaderPair hp @ HeaderPair { ( string_from name ) ( string_from val ) }
+        ( vec_push [HeaderPair] pv hp )
     }
 }
 
 @ ctx_set_cookie Ctx ctx s name s val → v {
-    : s rp . ctx resp
-    : i raw # i rp
-    ? != raw 0 {
-        : s hp # s rp
-        : HttpResponse r @ HttpResponse { hp }
+    : *CtxImpl impl # *CtxImpl . ctx ctl
+    : s rp . impl resp
+    ? != 0 # i rp {
+        : HttpResponse r @ HttpResponse { rp }
         ( response_set_cookie r name val ( cookie_opts_default ) )
     } {
         : HttpResponse r ( response_new 200 )
@@ -376,66 +342,55 @@ $ `stdlib/ext/http_full.nu`
     }
 }
 
-// Escape hatch: extract the owned HttpResponse out of the context.
-// Resets ctx.responded to F and ctx.resp to 0. The caller now owns
-// the response and must free it.
+// Extract the owned HttpResponse. Caller now owns the response.
 @ ctx_respond Ctx ctx → HttpResponse {
-    : s rp . ctx resp
-    : i raw # i rp
-    ? != raw 0 {
-        : s hp # s rp
-        : HttpResponse r @ HttpResponse { hp }
-        = . ctx resp # s 0
-        = . ctx responded F
+    : *CtxImpl impl # *CtxImpl . ctx ctl
+    : s rp . impl resp
+    ? != 0 # i rp {
+        : HttpResponse r @ HttpResponse { rp }
+        = . impl resp # s 0
         ^ r
     } {
         ^ ( response_status_only 204 )
     }
 }
 
-// ── App ──────────────────────────────────────────────────────────────
+// ── Internal: MwEntry (middleware slot) ──────────────────────────────
 //
-// The top-level application object. Owns a Router, a middleware chain,
-// config flags, and lifecycle hooks.
+// Single-pointer handle pattern. No linked list — Vec iteration only.
 
-// Internal middleware slot: closure handle + next pointer.
-// Stored as a boxed handle (single pointer) so Vec[MwSlot] doesn't
-// hit the multi-field-struct stride bug.
-: MwSlotImpl {
-    ( @ b Ctx ) mw
-    s next       // raw pointer to next MwSlotImpl, 0 = end
+: MwEntryImpl {
+    ( @ b Ctx ) mw       // the middleware closure
 }
 
-: MwSlot { s ctl }
+: MwEntry { s ctl }      // single-pointer handle → MwEntryImpl
 
-// Internal lifecycle hook list.
-: HookList {
-    ( Vec s ) hooks   // raw closure pointers
-}
+// ── Internal: GroupImpl ──────────────────────────────────────────────
 
-// Route group with shared prefix + group-local middleware.
 : GroupImpl {
-    App app            // borrowed parent app
+    App app               // borrowed parent app
     String prefix
-    ( Vec s ) mw_list  // boxed MwSlot pointers
+    ( Vec s ) mw_list     // boxed MwEntry pointers
 }
 
 : Group { s ctl }
 
+// ── App ──────────────────────────────────────────────────────────────
+
 : App {
     Router router
-    ( Vec s ) mw_chain       // boxed MwSlot pointers, applied in order
+    ( Vec s ) mw_chain       // boxed MwEntry pointers
     b use_cors
     b use_logging
     b use_metrics
-    b pretty_errors
     Metrics metrics
     i body_limit             // 0 = default 10 MB
     i idle_timeout_ms        // 0 = default 30s
     i workers                // 0 = default 16
+    i next_request_id        // incrementing counter
     String static_dir        // empty = no static serving
-    ( Vec s ) on_start_hooks // raw closure pointers
-    ( Vec s ) on_stop_hooks  // raw closure pointers
+    ( Vec s ) on_start_hooks
+    ( Vec s ) on_stop_hooks
 }
 
 // ── App construction ─────────────────────────────────────────────────
@@ -444,9 +399,10 @@ $ `stdlib/ext/http_full.nu`
     ^ @ App {
         ( router_new )
         ( vec_new [s] )
-        F F F F
+        F F F
         ( metrics_new )
         0 0 0
+        0
         ( string_new )
         ( vec_new [s] )
         ( vec_new [s] )
@@ -455,102 +411,83 @@ $ `stdlib/ext/http_full.nu`
 
 @ app_free App app → v {
     ( router_free . app router )
-    // Free middleware chain
     ( vec_free_with [s] . app mw_chain \ s p → v {
         ? != 0 # i p {
-            : *MwSlotImpl impl # *MwSlotImpl p
+            : *MwEntryImpl impl # *MwEntryImpl p
             ( nurl_free # s impl )
         } {}
     } )
     ( metrics_free . app metrics )
     ( string_free . app static_dir )
-    // Hook closures are (fn_ptr, env_ptr) pairs stored as raw s
-    // pointers — no special per-element cleanup needed.
     ( vec_free [s] . app on_start_hooks )
     ( vec_free [s] . app on_stop_hooks )
 }
 
 // ── Configuration ────────────────────────────────────────────────────
 
-@ app_with_cors App app → App {
-    = . app use_cors T
-    ^ app
-}
-
-@ app_with_logging App app → App {
-    = . app use_logging T
-    ^ app
-}
-
-@ app_with_metrics App app → App {
-    = . app use_metrics T
-    ^ app
-}
-
-@ app_with_body_limit App app i max_bytes → App {
-    = . app body_limit max_bytes
-    ^ app
-}
-
-@ app_with_idle_timeout App app i ms → App {
-    = . app idle_timeout_ms ms
-    ^ app
-}
-
-@ app_with_workers App app i n → App {
-    = . app workers n
-    ^ app
-}
-
-@ app_with_pretty_errors App app → App {
-    = . app pretty_errors T
-    ^ app
-}
+@ app_with_cors App app → App { = . app use_cors T ^ app }
+@ app_with_logging App app → App { = . app use_logging T ^ app }
+@ app_with_metrics App app → App { = . app use_metrics T ^ app }
+@ app_with_body_limit App app i max_bytes → App { = . app body_limit max_bytes ^ app }
+@ app_with_idle_timeout App app i ms → App { = . app idle_timeout_ms ms ^ app }
+@ app_with_workers App app i n → App { = . app workers n ^ app }
 
 @ app_static App app s dir → v {
     ( string_free . app static_dir )
     = . app static_dir ( string_from dir )
 }
 
-@ app_count App app → i {
-    ^ ( router_count . app router )
-}
+@ app_count App app → i { ^ ( router_count . app router ) }
 
 // ── Middleware registration ──────────────────────────────────────────
 
 @ app_use App app ( @ b Ctx ) mw → v {
-    : *MwSlotImpl impl # *MwSlotImpl ( nurl_alloc Z MwSlotImpl )
+    : *MwEntryImpl impl # *MwEntryImpl ( nurl_alloc Z MwEntryImpl )
     = . impl mw mw
-    = . impl next # s 0
     ( vec_push [s] . app mw_chain # s impl )
 }
 
-// ── Internal: build the full handler closure ─────────────────────────
+// ── Internal: single dispatch function ───────────────────────────────
 //
-// Takes the App's router + middleware chain + config, produces a
-// `( @ HttpResponse HttpRequest )` that the server can use.
-// The closure:
-//   1. Creates a Ctx from the HttpRequest
-//   2. Runs middleware chain (if any)
-//   3. If not responded, dispatches through the router
-//   4. If still not responded, returns 404
-//   5. Returns the response from the Ctx
+// One function for all dispatch: app routes and group routes.
+// Takes middleware chains and handler, creates Ctx, runs mw, calls
+// handler, extracts response. Called from route closures registered
+// on the router.
+//
+// All exit paths call __ctx_free to prevent memory leaks.
 
-@ __app_dispatch HttpRequest req Params params App app → HttpResponse {
+@ __dispatch HttpRequest req Params params App app ( Vec s ) app_mw ( Vec s ) group_mw ( @ v Ctx ) handler → HttpResponse {
     : i blimit . app body_limit
-    ? == blimit 0 { = blimit 10485760 } {}  // default 10 MB
+    ? == blimit 0 { = blimit 10485760 } {}
 
-    : Ctx ctx ( __ctx_new req params blimit )
+    // Null guard: if req pointer is null, return 500 immediately.
+    : i req_raw # i . req raw
+    ? == req_raw 0 {
+        ^ ( response_text 500 `internal error: null request\n` )
+    } {}
 
-    // Run middleware chain.
-    : i n_mw ( vec_len [s] . app mw_chain )
+    // Increment request ID.
+    = . app next_request_id + . app next_request_id 1
+    : i rid . app next_request_id
+
+    : Ctx ctx ( __ctx_new req params # s 0 blimit rid )
+
+    // Enforce body limit.
+    : HttpRequest req_inner @ HttpRequest { . ( # *CtxImpl . ctx ctl ) req }
+    : i body_len ( vec_len [u] . req_inner body )
+    ? > body_len blimit {
+        ( __ctx_free ctx )
+        ^ ( response_text 413 `request body too large\n` )
+    } {}
+
+    // Walk app-level middleware.
+    : i n_app_mw ( vec_len [s] app_mw )
     : ~ b proceed T
     : ~ i mi 0
-    ~ & proceed < mi n_mw {
-        : s slot_p ?? ( vec_get [s] . app mw_chain mi ) { T p → p F → # s 0 }
-        : i slot_raw # i slot_p
-        ? != slot_raw 0 {
-            : *MwSlotImpl impl # *MwSlotImpl slot_p
+    ~ & proceed < mi n_app_mw {
+        : s slot_p ?? ( vec_get [s] app_mw mi ) { T p → p F → # s 0 }
+        ? != 0 # i slot_p {
+            : *MwEntryImpl impl # *MwEntryImpl slot_p
             : ( @ b Ctx ) f . impl mw
             : b ok ( f ctx )
             ? == ok 0 { = proceed F } {}
@@ -558,107 +495,65 @@ $ `stdlib/ext/http_full.nu`
         = mi + mi 1
     }
 
-    // If middleware didn't abort, dispatch through router.
+    // Walk group-level middleware (app mw runs first, then group mw).
     ? proceed {
-        ? != . ctx responded T {} {
-            // Router dispatch — create a wrapper handler that writes into Ctx.
-            : HttpResponse routed ( router_handle . app router req )
-            ( __ctx_set_resp ctx routed )
-        }
-    } {}
-
-    // Extract the response from the Ctx.
-    : s rp . ctx resp
-    : i raw # i rp
-    ? != raw 0 {
-        : s hp # s rp
-        : HttpResponse final @ HttpResponse { hp }
-        = . ctx resp # s 0
-        = . ctx responded F
-        ^ final
-    } {
-        ^ ( response_text 404 `not found\n` )
-    }
-}
-
-// ── Route registration (App-level) ───────────────────────────────────
-//
-// Each route registers a wrapper closure on the router that converts
-// between the Ctx-based handler and the raw HttpRequest/Params/HttpResponse
-// contract the router expects.
-
-@ __register_route App app s method s pattern ( @ v Ctx ) handler → v {
-    // The handler closure captures `app` and `handler` by value.
-    // On dispatch it creates a Ctx, calls handler, then extracts
-    // the response.
-    ( router_any . app router method pattern
-    \ HttpRequest req Params params → HttpResponse {
-        : i blimit . app body_limit
-        ? == blimit 0 { = blimit 10485760 } {}
-
-        : Ctx ctx ( __ctx_new req params blimit )
-
-        // Run app-level middleware.
-        : i n_mw ( vec_len [s] . app mw_chain )
-        : ~ b proceed T
-        : ~ i mi 0
-        ~ & proceed < mi n_mw {
-            : s slot_p ?? ( vec_get [s] . app mw_chain mi ) { T p → p F → # s 0 }
-            : i slot_raw # i slot_p
-            ? != slot_raw 0 {
-                : *MwSlotImpl impl # *MwSlotImpl slot_p
+        : i n_grp_mw ( vec_len [s] group_mw )
+        : ~ i gi 0
+        ~ & proceed < gi n_grp_mw {
+            : s slot_p ?? ( vec_get [s] group_mw gi ) { T p → p F → # s 0 }
+            ? != 0 # i slot_p {
+                : *MwEntryImpl impl # *MwEntryImpl slot_p
                 : ( @ b Ctx ) f . impl mw
                 : b ok ( f ctx )
                 ? == ok 0 { = proceed F } {}
             } {}
-            = mi + mi 1
+            = gi + gi 1
         }
+    } {}
 
-        // If middleware passed, call the handler.
-        ? proceed {
-            ( handler ctx )
-        } {}
+    // Call handler.
+    ? proceed { ( handler ctx ) } {}
 
-        // Extract response.
-        : s rp . ctx resp
-        : i rraw # i rp
-        ? != rraw 0 {
-            : s hp # s rp
-            : HttpResponse r @ HttpResponse { hp }
-            = . ctx resp # s 0
-            = . ctx responded F
-            ^ r
-        } {
-            ^ ( response_text 500 `handler did not produce a response\n` )
-        }
+    // Check hijack — handler took over the connection.
+    : *CtxImpl impl # *CtxImpl . ctx ctl
+    ? . impl hijacked {
+        // Handler owns the conn. Return a synthetic response.
+        ( __ctx_free ctx )
+        ^ ( response_status_only 200 )
+    } {}
+
+    // Extract response.
+    : s rp . impl resp
+    ? != 0 # i rp {
+        : HttpResponse final @ HttpResponse { rp }
+        = . impl resp # s 0
+        ( __ctx_free ctx )
+        ^ final
+    } {
+        // No response set — synthesize 500.
+        ( __ctx_free ctx )
+        ^ ( response_text 500 `handler did not produce a response\n` )
+    }
+}
+
+// ── Route registration (App-level) ───────────────────────────────────
+
+@ __register_route App app s method s pattern ( @ v Ctx ) handler → v {
+    // Snapshot middleware at registration time.
+    : ( Vec s ) mw_snapshot . app mw_chain
+    ( router_any . app router method pattern
+    \ HttpRequest req Params params → HttpResponse {
+        ^ ( __dispatch req params app mw_snapshot ( vec_new [s] ) handler )
     } )
 }
 
-@ app_get App app s pattern ( @ v Ctx ) handler → v {
-    ( __register_route app `GET` pattern handler )
-}
-
-@ app_post App app s pattern ( @ v Ctx ) handler → v {
-    ( __register_route app `POST` pattern handler )
-}
-
-@ app_put App app s pattern ( @ v Ctx ) handler → v {
-    ( __register_route app `PUT` pattern handler )
-}
-
-@ app_patch App app s pattern ( @ v Ctx ) handler → v {
-    ( __register_route app `PATCH` pattern handler )
-}
-
-@ app_delete App app s pattern ( @ v Ctx ) handler → v {
-    ( __register_route app `DELETE` pattern handler )
-}
+@ app_get    App app s pattern ( @ v Ctx ) handler → v { ( __register_route app `GET` pattern handler ) }
+@ app_post   App app s pattern ( @ v Ctx ) handler → v { ( __register_route app `POST` pattern handler ) }
+@ app_put    App app s pattern ( @ v Ctx ) handler → v { ( __register_route app `PUT` pattern handler ) }
+@ app_patch  App app s pattern ( @ v Ctx ) handler → v { ( __register_route app `PATCH` pattern handler ) }
+@ app_delete App app s pattern ( @ v Ctx ) handler → v { ( __register_route app `DELETE` pattern handler ) }
 
 // ── Route groups ─────────────────────────────────────────────────────
-//
-// A Group is a scoped prefix with its own middleware. Routes registered
-// on the group have the prefix prepended. Group middleware runs after
-// app-level middleware but before the group's handlers.
 
 @ app_group App app s prefix → Group {
     : *GroupImpl gi # *GroupImpl ( nurl_alloc Z GroupImpl )
@@ -670,27 +565,33 @@ $ `stdlib/ext/http_full.nu`
 
 @ group_use Group g ( @ b Ctx ) mw → v {
     : *GroupImpl gi # *GroupImpl . g ctl
-    : *MwSlotImpl impl # *MwSlotImpl ( nurl_alloc Z MwSlotImpl )
+    : *MwEntryImpl impl # *MwEntryImpl ( nurl_alloc Z MwEntryImpl )
     = . impl mw mw
-    = . impl next # s 0
     ( vec_push [s] . gi mw_list # s impl )
 }
 
-// Join group prefix + route pattern.
+// Join group prefix + route pattern. Always inserts '/' separator
+// when neither prefix ends with '/' nor pattern starts with '/'.
 @ __group_path Group g s pattern → String {
     : *GroupImpl gi # *GroupImpl . g ctl
     : s pfx ( string_data . gi prefix )
     : i plen ( nurl_str_len pfx )
     : i slen ( nurl_str_len pattern )
-    // Drop trailing slash from prefix if pattern starts with /
+
+    // Determine if we need to drop trailing slash from prefix.
     : ~ i drop 0
     ? & > plen 0 == ( nurl_str_get pfx - plen 1 ) 47 { = drop 1 } {}
+    // Determine if we need to skip leading slash from pattern.
     : ~ i start 0
     ? & > slen 0 == ( nurl_str_get pattern 0 ) 47 { = start 1 } {}
+    // Do we need to insert a '/' separator?
+    : ~ b insert_sep F
+    ? & == drop 0 == start 0 { = insert_sep T } {}
 
-    : String path ( string_with_cap + plen slen 1 )
+    : String path ( string_with_cap + plen slen 2 )
     : ~ i k 0
     ~ < k - plen drop { ( string_push_char path ( nurl_str_get pfx k ) ) = k + k 1 }
+    ? insert_sep { ( string_push_char path 47 ) } {}
     = k start
     ~ < k slen { ( string_push_char path ( nurl_str_get pattern k ) ) = k + k 1 }
     ^ path
@@ -701,83 +602,20 @@ $ `stdlib/ext/http_full.nu`
     : String full_path ( __group_path g pattern )
     : App app . gi app
     : ( Vec s ) gmw . gi mw_list
-    : i n_gmw ( vec_len [s] gmw )
+    : ( Vec s ) app_mw . app mw_chain
 
     ( router_any . app router method ( string_data full_path )
     \ HttpRequest req Params params → HttpResponse {
-        : i blimit . app body_limit
-        ? == blimit 0 { = blimit 10485760 } {}
-
-        : Ctx ctx ( __ctx_new req params blimit )
-
-        // App-level middleware.
-        : i n_mw ( vec_len [s] . app mw_chain )
-        : ~ b proceed T
-        : ~ i mi 0
-        ~ & proceed < mi n_mw {
-            : s slot_p ?? ( vec_get [s] . app mw_chain mi ) { T p → p F → # s 0 }
-            : i slot_raw # i slot_p
-            ? != slot_raw 0 {
-                : *MwSlotImpl impl # *MwSlotImpl slot_p
-                : ( @ b Ctx ) f . impl mw
-                : b ok ( f ctx )
-                ? == ok 0 { = proceed F } {}
-            } {}
-            = mi + mi 1
-        }
-
-        // Group-level middleware.
-        ? proceed {
-            : ~ i gi2 0
-            ~ & proceed < gi2 n_gmw {
-                : s slot_p ?? ( vec_get [s] gmw gi2 ) { T p → p F → # s 0 }
-                : i slot_raw # i slot_p
-                ? != slot_raw 0 {
-                    : *MwSlotImpl impl # *MwSlotImpl slot_p
-                    : ( @ b Ctx ) f . impl mw
-                    : b ok ( f ctx )
-                    ? == ok 0 { = proceed F } {}
-                } {}
-                = gi2 + gi2 1
-            }
-        } {}
-
-        ? proceed { ( handler ctx ) } {}
-
-        : s rp . ctx resp
-        : i rraw # i rp
-        ? != rraw 0 {
-            : s hp # s rp
-            : HttpResponse r @ HttpResponse { hp }
-            = . ctx resp # s 0
-            = . ctx responded F
-            ^ r
-        } {
-            ^ ( response_text 500 `handler did not produce a response\n` )
-        }
+        ^ ( __dispatch req params app app_mw gmw handler )
     } )
     ( string_free full_path )
 }
 
-@ group_get Group g s pattern ( @ v Ctx ) handler → v {
-    ( __group_register g `GET` pattern handler )
-}
-
-@ group_post Group g s pattern ( @ v Ctx ) handler → v {
-    ( __group_register g `POST` pattern handler )
-}
-
-@ group_put Group g s pattern ( @ v Ctx ) handler → v {
-    ( __group_register g `PUT` pattern handler )
-}
-
-@ group_patch Group g s pattern ( @ v Ctx ) handler → v {
-    ( __group_register g `PATCH` pattern handler )
-}
-
-@ group_delete Group g s pattern ( @ v Ctx ) handler → v {
-    ( __group_register g `DELETE` pattern handler )
-}
+@ group_get    Group g s pattern ( @ v Ctx ) handler → v { ( __group_register g `GET` pattern handler ) }
+@ group_post   Group g s pattern ( @ v Ctx ) handler → v { ( __group_register g `POST` pattern handler ) }
+@ group_put    Group g s pattern ( @ v Ctx ) handler → v { ( __group_register g `PUT` pattern handler ) }
+@ group_patch  Group g s pattern ( @ v Ctx ) handler → v { ( __group_register g `PATCH` pattern handler ) }
+@ group_delete Group g s pattern ( @ v Ctx ) handler → v { ( __group_register g `DELETE` pattern handler ) }
 
 // ── Lifecycle hooks ──────────────────────────────────────────────────
 
@@ -803,9 +641,6 @@ $ `stdlib/ext/http_full.nu`
 }
 
 // ── Static serving ───────────────────────────────────────────────────
-//
-// If `app_static` was called, register a catch-all GET route that
-// serves files from the configured directory.
 
 @ __register_static App app → v {
     : i slen ( string_len . app static_dir )
@@ -841,7 +676,6 @@ $ `stdlib/ext/http_full.nu`
                     }
                 }
                 F _ → {
-                    // No path param — serve index.html
                     : String idx ( path_join ( string_data dir_copy ) `index.html` )
                     : ! ( Vec u ) IoErr rd ( read_file_bytes ( string_data idx ) )
                     ( string_free idx )
@@ -863,12 +697,17 @@ $ `stdlib/ext/http_full.nu`
 }
 
 // ── app_run ──────────────────────────────────────────────────────────
-//
-// The main entry point. Wires up all the pieces and starts the server.
 
 @ app_run App app s host i port → i {
     // Register static route if configured.
     ( __register_static app )
+
+    // Auto-register /health when metrics are enabled.
+    ? . app use_metrics {
+        ( app_get app `/health` \ Ctx ctx → v {
+            ( ctx_json_str ctx 200 `{"status":"ok"}` )
+        } )
+    } {}
 
     // Run on_start hooks.
     ( __run_hooks . app on_start_hooks )
@@ -876,8 +715,6 @@ $ `stdlib/ext/http_full.nu`
     // Build the base handler that dispatches through the router.
     : ( @ HttpResponse HttpRequest ) base
     \ HttpRequest req → HttpResponse {
-        // Use manual_dispatch-style routing: create empty params,
-        // let router_handle do the dispatch.
         ^ ( router_handle . app router req )
     }
 
@@ -905,7 +742,9 @@ $ `stdlib/ext/http_full.nu`
             : i wk . app workers
             ? == wk 0 { = wk 16 } {}
 
-            ( nurl_print `[nurl-app] listening on http://` )
+            ( nurl_print `[nurl-app v` )
+            ( nurl_print __NURL_APP_VERSION )
+            ( nurl_print `] listening on http://` )
             ( nurl_print host )
             ( nurl_print `:` )
             ( nurl_print ( nurl_str_int port ) )
