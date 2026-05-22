@@ -1,8 +1,18 @@
 // stdlib/ext/nurl_app.nu — high-level web framework for NURL.  v0.2.0
 //
 // Inspired by FastAPI, Koa, and Express. Layers ergonomics on top of
-// the existing Phase 1–9 HTTP stack. Pure NURL stdlib module — no
-// compiler or runtime changes required.
+// the existing Phase 1–9 HTTP stack:
+//
+//   * Phase 1:  tcp_listen / tcp_accept / TcpConn           (std/net)
+//   * Phase 2:  HttpRequest / parse_request_head             (ext/http_request)
+//   * Phase 3:  HttpResponse / response_text / response_json (ext/http_response)
+//   * Phase 4-5: server_new / server_run / server_run_pool   (ext/http_server)
+//   * Phase 6:  Router / router_get / router_handle / Params (ext/http_router)
+//   * Phase 7:  serve_static / auth / cookies                (ext/http_static, ext/http_auth)
+//   * Phase 8:  with_access_log / with_metrics / Metrics      (ext/http_middleware)
+//   * Phase 9:  multipart / WebSocket / HTTP/2 / TLS          (ext/websocket, ...)
+//
+// Pure NURL stdlib module — no compiler or runtime changes required.
 //
 // ── Quick start ──────────────────────────────────────────────────────
 //
@@ -18,17 +28,107 @@
 //       ^ ( app_run app `0.0.0.0` 8080 )
 //     }
 //
+// ── Core concepts ────────────────────────────────────────────────────
+//
+//   App       — top-level application builder. Owns Router + middleware
+//               chain + config. Created via `app_new`, routes registered
+//               via `app_get` / `app_post` / etc., run via `app_run`.
+//
+//   Ctx       — per-request context. Heap-allocated via boxed-handle
+//               pattern (Ctx { s ctl } → CtxImpl). Read the request,
+//               build the response. The framework frees CtxImpl on all
+//               exit paths after the handler returns.
+//
+//   Handler   — `( @ v Ctx )` closure. Receives a borrowed Ctx, writes
+//               a response into it, returns void. The framework serialises
+//               the response after the handler returns.
+//
+//   Middleware — `( @ b Ctx )` closure. Runs before the handler. Return
+//               `T` to continue the chain, `F` to abort (response already
+//               set). Applied in registration order.
+//
+//   Group     — route group with shared prefix + group-local middleware.
+//               Created via `app_group`. Middleware on the group applies
+//               to every route in the group.
+//
+//   Streaming — call `ctx_hijack` to take ownership of the TcpConn for
+//               WebSocket or SSE. Only available via `app_run_streaming`.
+//
 // ── API ──────────────────────────────────────────────────────────────
 //
-//   App:     app_new, app_free, app_with_*, app_static, app_count
-//   Routes:  app_get/post/put/patch/delete, app_use
-//   Groups:  app_group, group_get/post/put/patch/delete, group_use
-//   Server:  app_run, app_run_streaming, app_on_start, app_on_stop
-//   Ctx req: ctx_method/path/query_string/header/param/body_string/
-//            body_json/query_get/form_get/cookie/bearer/basic_auth
-//   Ctx res: ctx_text/html/json_str/json/redirect/status/
-//            set_header/set_cookie/respond
-//   Stream:  ctx_hijack, ctx_stream_begin/write/end, ctx_upgrade_ws
+//   App construction:
+//     ( app_new )                                        → App
+//     ( app_free App app )                               → v
+//
+//   Configuration (call before app_run):
+//     ( app_with_cors App app )                          → App
+//     ( app_with_logging App app )                       → App
+//     ( app_with_metrics App app )                       → App
+//     ( app_with_body_limit App app i max_bytes )        → App
+//     ( app_with_idle_timeout App app i ms )             → App
+//     ( app_with_workers App app i n )                   → App
+//     ( app_static App app s dir )                       → v
+//
+//   Route registration:
+//     ( app_get    App app s pattern ( @ v Ctx ) handler ) → v
+//     ( app_post   App app s pattern ( @ v Ctx ) handler ) → v
+//     ( app_put    App app s pattern ( @ v Ctx ) handler ) → v
+//     ( app_patch  App app s pattern ( @ v Ctx ) handler ) → v
+//     ( app_delete App app s pattern ( @ v Ctx ) handler ) → v
+//
+//   Middleware:
+//     ( app_use App app ( @ b Ctx ) mw )                 → v
+//
+//   Route groups:
+//     ( app_group App app s prefix )                     → Group
+//     ( group_get    Group g s pattern ( @ v Ctx ) h )    → v
+//     ( group_post   Group g s pattern ( @ v Ctx ) h )    → v
+//     ( group_put    Group g s pattern ( @ v Ctx ) h )    → v
+//     ( group_patch  Group g s pattern ( @ v Ctx ) h )    → v
+//     ( group_delete Group g s pattern ( @ v Ctx ) h )    → v
+//     ( group_use    Group g ( @ b Ctx ) mw )             → v
+//
+//   Server lifecycle:
+//     ( app_run App app s host i port )                  → i
+//     ( app_run_streaming App app s host i port )        → i
+//     ( app_on_start App app ( @ v ) hook )              → v
+//     ( app_on_stop  App app ( @ v ) hook )              → v
+//
+//   Ctx — request accessors:
+//     ( ctx_method       Ctx ctx ) → s
+//     ( ctx_path         Ctx ctx ) → s
+//     ( ctx_query_string Ctx ctx ) → s
+//     ( ctx_header       Ctx ctx s name ) → ? String
+//     ( ctx_param        Ctx ctx s name ) → ? String
+//     ( ctx_body_string  Ctx ctx ) → String            // OWNED
+//     ( ctx_body_json    Ctx ctx ) → ! Json ParseErr    // OWNED (Ok arm)
+//     ( ctx_query_get    Ctx ctx s key ) → ? String
+//     ( ctx_form_get     Ctx ctx s key ) → ? String
+//     ( ctx_cookie       Ctx ctx s name ) → ? String
+//     ( ctx_bearer       Ctx ctx ) → ? String
+//     ( ctx_basic_auth   Ctx ctx ) → ? BasicAuth
+//
+//   Ctx — response builders (each sets status + body + Content-Type):
+//     ( ctx_text        Ctx ctx i status s body ) → v
+//     ( ctx_html        Ctx ctx i status s body ) → v
+//     ( ctx_json_str    Ctx ctx i status s body ) → v
+//     ( ctx_json        Ctx ctx i status Json j ) → v
+//     ( ctx_redirect    Ctx ctx i status s url )  → v
+//     ( ctx_status      Ctx ctx i status )        → v
+//     ( ctx_set_header  Ctx ctx s name s val )    → v
+//     ( ctx_set_cookie  Ctx ctx s name s val )    → v
+//
+//     ( ctx_respond Ctx ctx ) → HttpResponse       // OWNED, for escape hatches
+//
+//   Streaming (app_run_streaming only):
+//     ( ctx_hijack Ctx ctx ) → TcpConn              // one-way door, owns conn
+//     ( ctx_stream_begin Ctx ctx i status ) → ! v NetErr
+//     ( ctx_stream_write Ctx ctx s data ) → ! v NetErr
+//     ( ctx_stream_end Ctx ctx ) → ! v NetErr
+//     ( ctx_upgrade_ws Ctx ctx ( @ ! v WsErr WsMessage ) handler ) → ! v WsErr
+//
+//   Helpers:
+//     ( app_count App app ) → i                   // number of registered routes
 
 $ `stdlib/ext/http_full.nu`
 
@@ -241,8 +341,13 @@ $ `stdlib/ext/http_full.nu`
 
 // ── Ctx response builders ────────────────────────────────────────────
 //
-// Each builder allocates an HttpResponse, stores it in impl.resp
-// (freeing any previous one), and applies any pending headers.
+// Each builder creates an owned HttpResponse, stores it in impl.resp,
+// and applies any pending headers. If a previous response was set, it
+// is freed first (last-write-wins, matching Koa semantics).
+//
+// If ctx_set_header was called before a response exists, those headers
+// are stored in a pending list and applied when the first response is
+// set via any ctx_* builder.
 
 @ __ctx_set_resp Ctx ctx HttpResponse r → v {
     : *CtxImpl impl # *CtxImpl . ctx ctl
