@@ -464,3 +464,22 @@ For SSE / streaming: handlers that need raw streaming use `ctx_stream_begin` whi
 - **Grammar:** `spec/grammar_v2.0.ebnf`
 - **Route boxed-handle pattern:** `http_router.nu` lines 73-84
 - **Middleware closure pattern:** `http_router.nu` lines 310-340, `http_middleware.nu`
+
+## GSTACK REVIEW REPORT
+
+| Review | Trigger | Why | Runs | Status | Findings |
+|--------|---------|-----|------|--------|----------|
+| CEO Review | `/plan-ceo-review` | Scope & strategy | 1 | issues_open | SELECTIVE EXPANSION, approach B accepted, 3 findings (1 CRITICAL) |
+
+**CRITICAL GAP:** SSE streaming and WebSocket upgrade architecturally conflict with `http_server.nu`'s write path. The server's `__serve_keepalive_loop` always calls `__write_response` after the handler returns (line 647 of http_server.nu). If a handler performs chunked streaming or WS handshake directly on the TcpConn, the server then writes a second response on the same connection — protocol corruption. The plan's claim that "the dispatch layer sees that streaming has started and skips the normal serialize+write path" is incorrect because the dispatch layer does not control `http_server.nu`'s behavior. The server is the caller; the handler is the callee.
+
+**Fix required:** The framework must either (a) use a custom accept loop instead of `server_run_pool` for streaming-capable servers, (b) use the existing `response_begin_chunked` + `response_write_chunk` + `response_end_chunked` pattern where the handler returns a normal 200 HttpResponse and the chunked streaming happens via the server's normal write path (not possible with current http_server.nu), or (c) introduce a convention where the handler returns a sentinel response that the framework's outer handler closure intercepts before the server sees it. Option (c) is the least invasive: wrap `server_run_pool`'s handler in a closure that checks the Ctx for streaming/WS state and, if active, handles the conn lifecycle itself without returning to the server's write path. This requires the framework to manage the TcpConn close, which conflicts with the server's close. **Recommended: option (a)** — the framework provides its own `__app_serve_conn` function that replaces the keep-alive loop for connections that need streaming.
+
+**WARNING:** Middleware registration order constraint. Middleware is snapshot-captured at route registration time (D5). If a user calls `app_use` after `app_get`, the middleware does not apply to routes already registered. This is the Express behavior but should be documented prominently in the API docs and the README. Recommended: add a runtime warning when `app_use` is called after any route has been registered.
+
+**INFO:** R8 ("no raw pointer casts") is overstated. The boxed-handle `{ s ctl }` pattern internally stores raw `s` pointers — this is the established NURL idiom (Route, Regex, Channel, McpClient all do this). R8 should be refined to: "no raw `s` punning in user-visible API types — internal boxed handles follow the `Route { s ctl }` pattern."
+
+**UNRESOLVED:** 0 (all findings have recommended fixes)
+**VERDICT:** CEO REVIEW — 1 CRITICAL GAP requires architectural decision before implementation begins
+REVIEW_EOF
+echo "appended review report"
