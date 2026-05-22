@@ -1,10 +1,9 @@
 // examples/web_app.nu — demo of the nurl_app web framework.
 //
 // Showcases: routing, JSON request/response, query params,
-// route groups, middleware, static serving, lifecycle hooks.
+// route groups, middleware, lifecycle hooks.
 //
 // Build & run:
-//     ./build.sh
 //     ./nurl.sh examples/web_app.nu
 //
 // Try:
@@ -15,8 +14,8 @@
 //     curl http://127.0.0.1:8090/api/items?q=search
 //     curl http://127.0.0.1:8090/api/secret          # 401
 //     curl -H "Authorization: Bearer my-token" http://127.0.0.1:8090/api/secret
-//     curl http://127.0.0.1:8090/metrics              # Prometheus text
 //     curl http://127.0.0.1:8090/health
+//     curl http://127.0.0.1:8090/metrics
 
 $ `stdlib/ext/nurl_app.nu`
 
@@ -36,7 +35,6 @@ $ `stdlib/ext/nurl_app.nu`
     <li><a href="/api/items?q=search">/api/items?q=search</a> — query params</li>
     <li><a href="/api/secret">/api/secret</a> — bearer auth</li>
     <li><a href="/health">/health</a> — health check</li>
-    <li><a href="/metrics">/metrics</a> — Prometheus metrics</li>
   </ul>
 </body>
 </html>\n` )
@@ -87,8 +85,6 @@ $ `stdlib/ext/nurl_app.nu`
 }
 
 @ h_metrics Ctx ctx → v {
-    // Use the App's metrics handler — we pass it through global state
-    // for simplicity in this example.
     ( ctx_text ctx 200 `# nurl_app demo — metrics endpoint\n` )
 }
 
@@ -98,11 +94,9 @@ $ `stdlib/ext/nurl_app.nu`
     : ? String tok ( ctx_bearer ctx )
     ?? tok {
         T t → {
-            // Accept any non-empty bearer token for the demo.
             : b ok != 0 ( nurl_str_eq ( string_data t ) `` )
             ( string_free t )
             ? ok {
-                // No valid token → abort with 401
                 ( ctx_text ctx 401 `{"error":"unauthorized"}\n` )
                 ^ F
             } { ^ T }
@@ -126,7 +120,7 @@ $ `stdlib/ext/nurl_app.nu`
     // Enable built-in middleware.
     ( app_with_logging app )
     ( app_with_cors app )
-    ( app_with_pretty_errors app )
+    ( app_with_metrics app )
 
     // Basic routes.
     ( app_get app `/` \ Ctx ctx → v { ( h_index ctx ) } )
@@ -153,7 +147,7 @@ $ `stdlib/ext/nurl_app.nu`
         ( nurl_print `[demo] server shutting down.\n` )
     } )
 
-    ( nurl_print `nurl_app demo — try Ctrl+C to shut down cleanly\n` )
+    ( nurl_print `nurl_app demo — try Ctrl+C to shut down\n` )
     : i rc ( app_run app `127.0.0.1` 8090 )
     ( app_free app )
     ^ rc
