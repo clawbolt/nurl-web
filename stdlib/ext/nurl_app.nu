@@ -1,4 +1,4 @@
-// stdlib/ext/nurl_app.nu — high-level web framework for NURL.  v0.2.1
+// stdlib/ext/nurl_app.nu — high-level web framework for NURL.  v0.2.2
 //
 // Inspired by FastAPI, Koa, and Express. Layers ergonomics on top of
 // the existing Phase 1–9 HTTP stack:
@@ -116,7 +116,7 @@
 //     ( ctx_redirect    Ctx ctx i status s url )  → v
 //     ( ctx_status      Ctx ctx i status )        → v
 //     ( ctx_set_header  Ctx ctx s name s val )    → v
-//     ( ctx_set_cookie  Ctx ctx s name s val )    → v  // call after response builder
+//     ( ctx_set_cookie  Ctx ctx s name s val )    → v
 //
 //     ( ctx_respond Ctx ctx ) → HttpResponse       // OWNED, for escape hatches
 //
@@ -133,7 +133,7 @@
 $ `stdlib/ext/http_full.nu`
 
 // ── Version ──────────────────────────────────────────────────────────
-: __NURL_APP_VERSION s `0.2.1`
+: __NURL_APP_VERSION s `0.2.2`
 
 // ── Internal: CtxImpl (heap-allocated per-request state) ─────────────
 //
@@ -158,9 +158,17 @@ $ `stdlib/ext/http_full.nu`
     i state              // generic scratch for middleware
     b hijacked           // handler called ctx_hijack
     s pending_headers    // heap Vec[HeaderPair] (0 = null)
+    s pending_cookies     // heap Vec[PendingCookie] (0 = null)
 }
 
 : Ctx { s ctl }         // single-pointer handle → CtxImpl
+
+// Pending cookie data for deferred cookie application.
+: PendingCookie {
+    String name
+    String value
+}
+
 
 // ── Ctx constructors ─────────────────────────────────────────────────
 
@@ -175,6 +183,7 @@ $ `stdlib/ext/http_full.nu`
     = . impl state 0
     = . impl hijacked F
     = . impl pending_headers # s 0
+    = . impl pending_cookies # s 0
     ^ @ Ctx { # s impl }
 }
 
@@ -197,6 +206,20 @@ $ `stdlib/ext/http_full.nu`
         // (key/value are borrowed from the header string), so vec_free
         // is sufficient.
         ( vec_free [HeaderPair] pv )
+    } {}
+
+    // Free pending cookies (if any).
+    : s pc . impl pending_cookies
+    ? != 0 # i pc {
+        : ( Vec PendingCookie ) pcv @ ( Vec PendingCookie ) { pc }
+        : i cn ( vec_len [PendingCookie] pcv )
+        : ~ i ci 0
+        ~ < ci cn {
+            : ? PendingCookie co ( vec_get [PendingCookie] pcv ci )
+            ?? co { T c → { ( string_free . c name ) ( string_free . c value ) } F → {} }
+            = ci + ci 1
+        }
+        ( vec_free [PendingCookie] pcv )
     } {}
 
     // Free the CtxImpl itself. Do NOT free req/params/conn — those
@@ -375,6 +398,24 @@ $ `stdlib/ext/http_full.nu`
         ( vec_free [HeaderPair] pv )
         = . impl pending_headers # s 0
     } {}
+
+    // Apply pending cookies (if any).
+    : s pc . impl pending_cookies
+    ? != 0 # i pc {
+        : ( Vec PendingCookie ) pcv @ ( Vec PendingCookie ) { pc }
+        : i cn ( vec_len [PendingCookie] pcv )
+        : ~ i ci 0
+        ~ < ci cn {
+            : ? PendingCookie co ( vec_get [PendingCookie] pcv ci )
+            ?? co { T c → {
+                ( response_set_cookie r ( string_data . c name ) ( string_data . c value ) ( cookie_opts_default ) )
+                ( string_free . c name ) ( string_free . c value )
+            } F → {} }
+            = ci + ci 1
+        }
+        ( vec_free [PendingCookie] pcv )
+        = . impl pending_cookies # s 0
+    } {}
 }
 
 @ ctx_text Ctx ctx i status s body → v {
@@ -435,12 +476,19 @@ $ `stdlib/ext/http_full.nu`
     : *CtxImpl impl # *CtxImpl . ctx ctl
     : s rp . impl resp
     ? != 0 # i rp {
+        // Response exists — apply directly.
         : HttpResponse r @ HttpResponse { rp }
         ( response_set_cookie r name val ( cookie_opts_default ) )
     } {
-        : HttpResponse r ( response_new 200 )
-        ( response_set_cookie r name val ( cookie_opts_default ) )
-        ( __ctx_set_resp ctx r )
+        // No response yet — append to pending cookies.
+        : s pc . impl pending_cookies
+        ? == 0 # i pc {
+            = . impl pending_cookies # s ( vec_new [PendingCookie] )
+        } {}
+        : s pc2 . impl pending_cookies
+        : ( Vec PendingCookie ) pcv @ ( Vec PendingCookie ) { pc2 }
+        : PendingCookie c @ PendingCookie { ( string_from name ) ( string_from val ) }
+        ( vec_push [PendingCookie] pcv c )
     }
 }
 
