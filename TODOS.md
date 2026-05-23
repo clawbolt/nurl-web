@@ -26,14 +26,10 @@
 - **Context:** Noted during Section 8 observability review. Deferred for v1.
 - **Effort:** S
 
-## P3 — ctx_set_cookie phantom response ordering
-- **What:** `ctx_set_cookie` creates a phantom `response_new 200` when called before any response builder. If the handler later calls `ctx_text 404`, the phantom 200 (and its cookie) is freed and lost.
-- **Why:** The pending-headers mechanism (D10) was designed to avoid this pattern, but cookies weren't included in it.
-- **Workaround:** Call `ctx_set_cookie` *after* the response builder (e.g., after `ctx_text`, `ctx_json_str`).
-- **Pros of fix:** Correct behavior regardless of call order
-- **Cons of fix:** Adds a pending_cookies Vec to CtxImpl, increases complexity
-- **Effort:** M
-- **Depends on:** None
+## ~~P3~~ DONE — ctx_set_cookie phantom response ordering (fixed in v0.2.2)
+- **What:** `ctx_set_cookie` now uses a `pending_cookies` mechanism (mirrors `pending_headers`). Cookies set before a response exists are stored in a `Vec[PendingCookie]` on CtxImpl and applied when the response is set via any `ctx_*` builder. No more phantom `response_new 200`.
+- **Fixed by:** Added `PendingCookie` struct, `pending_cookies` field to CtxImpl, apply in `__ctx_set_resp`, free in `__ctx_free`.
+- **Effort:** S (done)
 
 ## P2 — Streaming accept loop writes to potentially-active conn
 - **What:** After `ctx_hijack`, `app_run_streaming` still calls `__write_response` on the conn. For long-lived WebSocket handlers, this could inject garbage HTTP data onto the active connection.
