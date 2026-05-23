@@ -1,7 +1,7 @@
 ---
 title: "feat: Comprehensive test coverage for nurl_app.nu"
 type: feat
-status: active
+status: completed
 date: 2026-05-23
 deepened: 2026-05-23
 origin: docs/plans/2026-05-23-001-feat-optimal-web-framework-beta-plan.md
@@ -115,7 +115,7 @@ Rationale: Tests need to verify response status and headers. Rather than reachin
 
 ## Implementation Units
 
-- [ ] **Unit 1: Test infrastructure**
+- [x] **Unit 1: Test infrastructure**
 
 **Goal:** Create the test runner script, assertion helpers, and HttpRequest construction utilities that all other test files depend on.
 
@@ -149,7 +149,7 @@ Rationale: Tests need to verify response status and headers. Rather than reachin
 - `test.sh` runs successfully (exits 0 when all tests pass)
 - Each assertion helper returns correct 0/1
 
-- [ ] **Unit 2: Ctx lifecycle tests**
+- [x] **Unit 2: Ctx lifecycle tests**
 
 **Goal:** Cover `__ctx_new` and `__ctx_free` — construction, field initialization, cleanup with and without a response set.
 
@@ -178,7 +178,7 @@ Rationale: Tests need to verify response status and headers. Rather than reachin
 **Verification:**
 - All 6+ test functions return 0
 
-- [ ] **Unit 3: Ctx request accessor tests**
+- [x] **Unit 3: Ctx request accessor tests**
 
 **Goal:** Cover all 12 request accessors: `ctx_method`, `ctx_path`, `ctx_query_string`, `ctx_header`, `ctx_param`, `ctx_body_string`, `ctx_body_json`, `ctx_query_get`, `ctx_form_get`, `ctx_cookie`, `ctx_bearer`, `ctx_basic_auth`.
 
@@ -213,7 +213,7 @@ Rationale: Tests need to verify response status and headers. Rather than reachin
 - All 12 accessors have at least 2 test cases each (happy + edge)
 - Total test functions: 25+
 
-- [ ] **Unit 4: Ctx response builder tests**
+- [x] **Unit 4: Ctx response builder tests**
 
 **Goal:** Cover all 9 response builders: `ctx_text`, `ctx_html`, `ctx_json_str`, `ctx_json`, `ctx_redirect`, `ctx_status`, `ctx_set_header`, `ctx_set_cookie`, `ctx_respond`, plus the internal `__ctx_set_resp`.
 
@@ -250,7 +250,7 @@ Rationale: Tests need to verify response status and headers. Rather than reachin
 **Verification:**
 - 14+ test functions, all return 0
 
-- [ ] **Unit 5: Internal helper tests**
+- [x] **Unit 5: Internal helper tests**
 
 **Goal:** Cover `__body_to_string`, `__search_pair`, `__group_path`, `__walk_mw`.
 
@@ -298,7 +298,7 @@ Rationale: Tests need to verify response status and headers. Rather than reachin
 - All 4 internal helpers have direct test coverage
 - `__group_path` covers all 4 slash combinations explicitly
 
-- [ ] **Unit 6: App lifecycle tests**
+- [x] **Unit 6: App lifecycle tests**
 
 **Goal:** Cover `app_new`, `app_free`, all `app_with_*` config functions, `app_static`, `app_count`, `app_use`, `app_on_start`, `app_on_stop`.
 
@@ -336,7 +336,7 @@ Rationale: Tests need to verify response status and headers. Rather than reachin
 **Verification:**
 - 12+ test functions
 
-- [ ] **Unit 7: Route registration tests**
+- [x] **Unit 7: Route registration tests**
 
 **Goal:** Cover `app_get/post/put/patch/delete`, `app_group`, `group_get/post/put/patch/delete`, `group_use`, `__register_route`, `__group_register`.
 
@@ -371,7 +371,7 @@ Rationale: Tests need to verify response status and headers. Rather than reachin
 - 8+ test functions
 - Route count verification through `app_count`
 
-- [ ] **Unit 8: Middleware and dispatch tests**
+- [x] **Unit 8: Middleware and dispatch tests**
 
 **Goal:** Cover `__walk_mw`, `__dispatch` comprehensively — the core request processing pipeline.
 
@@ -423,7 +423,7 @@ Rationale: Tests need to verify response status and headers. Rather than reachin
 - 12+ test functions covering all dispatch paths
 - Every exit path through `__dispatch` is exercised
 
-- [ ] **Unit 9: Static serving tests**
+- [x] **Unit 9: Static serving tests**
 
 **Goal:** Cover `__register_static` and the static file handler logic.
 
@@ -454,7 +454,7 @@ Rationale: Tests need to verify response status and headers. Rather than reachin
 **Verification:**
 - 6+ test functions
 
-- [ ] **Unit 10: Health and hooks tests**
+- [x] **Unit 10: Health and hooks tests**
 
 **Goal:** Cover `__register_health`, `__run_hooks`, `__prepare_run`, `app_on_start`, `app_on_stop`.
 
@@ -486,7 +486,7 @@ Rationale: Tests need to verify response status and headers. Rather than reachin
 **Verification:**
 - 7+ test functions (including __print_banner smoke and __write_response smoke)
 
-- [ ] **Unit 11: Integration tests (network-gated)**
+- [x] **Unit 11: Integration tests (network-gated)**
 
 **Goal:** End-to-end tests that start a server, send real HTTP requests, and verify responses. Gated behind `NURL_NET_TESTS=1`.
 
@@ -532,7 +532,7 @@ Rationale: Tests need to verify response status and headers. Rather than reachin
 - All gated behind `NURL_NET_TESTS=1`
 - Tests can run against both `app_run` and `app_run_streaming`
 
-- [ ] **Unit 12: Streaming and WebSocket tests (network-gated)**
+- [x] **Unit 12: Streaming and WebSocket tests (network-gated)**
 
 **Goal:** Cover `ctx_hijack`, `ctx_stream_begin/write/end`, `ctx_upgrade_ws`, `app_run_streaming`, `__write_response`.
 
